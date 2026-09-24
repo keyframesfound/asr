@@ -12,13 +12,12 @@ os.environ["TQDM_DISABLE"] = "1"
 
 import numpy as np
 
+from .audio_util import prepare_chunk
 from .base import LiveEngine, OnFinal, OnPartial, SessionSummary
 from .mic import open_input_stream
 
 MODEL_DIR = Path(__file__).resolve().parents[1] / "models" / "whisper-large-v3-turbo"
 CHUNK_SEC = 4.0
-# Drop near-silent chunks (Whisper otherwise hallucinates "you" / ".").
-MIN_RMS = 0.012
 # Filter common silence hallucinations.
 JUNK = {"", "you", "thank you", "thanks for watching", ".", "...", "字幕", "字幕by", "thanks"}
 
@@ -140,8 +139,8 @@ class WhisperTurboEngine(LiveEngine):
         model, processor, device, dtype = _MODEL, _PROCESSOR, _DEVICE, _DTYPE
 
         def transcribe(audio: np.ndarray) -> str:
-            rms = float(np.sqrt(np.mean(np.square(audio), dtype=np.float64)))
-            if rms < MIN_RMS:
+            audio = prepare_chunk(audio)
+            if audio is None:
                 return ""
             inputs = processor(audio, sampling_rate=sample_rate, return_tensors="pt")
             input_features = inputs.input_features.to(device=device, dtype=dtype)

@@ -20,3 +20,6 @@ models/*/
 *.log
 .DS_Store
 VERIFY.json
+
+# MLX Parakeet cache
+models/parakeet-mlx/

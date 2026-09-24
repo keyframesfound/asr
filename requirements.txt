@@ -5,5 +5,8 @@ python-dotenv>=1.0.0
 torch>=2.0.0
 transformers>=4.40.0
 textual>=0.80.0
-# Optional for SenseVoice:
-# funasr>=1.0.0
+# SenseVoice (FunASR + fbank backend)
+funasr>=1.0.0
+kaldi-native-fbank>=1.20.0
+# Parakeet on Apple Silicon (MLX)
+parakeet-mlx>=0.5.0
