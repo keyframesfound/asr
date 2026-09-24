@@ -61,7 +61,11 @@ Bottom action bar buttons are clickable; the same actions work from the keyboard
 | Ctrl+C | Stop the current listening session |
 | q / Esc | Quit (Esc on picker) |
 
-Caption shows **Listening…** / **Transcribing…**, then drafts appear word by word (CJK character by character) with a soft fade-in; finals land in the dim-timestamped log. A slim meter row shows the live mic level, device name, dB, clipping, and transcript counts.
+Caption shows **Listening…** / **Transcribing…**, then drafts appear word by word (CJK character by character) with a soft fade-in; finals land in the transcript log as plain lines. The status line shows the state plus the mic in use (`listening · AirPods Pro`), and the meter row's ● dot + zone-colored bar pulse with the input level so you can see it is listening (○ = no signal), with dB, CLIP, and transcript counts.
+
+### Full-session polish (stop = re-decode)
+
+While live, the app records every raw mic block. When you stop (**space**), it batch-decodes the whole recording in one pass — full-utterance context, pause-aware boundaries, no early-frozen partials, no discarded windows — and replaces the transcript with the polished text. This is the accuracy model of push-to-talk dictation apps, layered on top of the live captions. Disable with `post_stop_polish: false` (config.json) — on speakers (no headphones) room echo lands in the raw recording and can duplicate lines in the polished output.
 
 ### Settings & mic picker
 
@@ -103,6 +107,7 @@ Tunable knobs live in `config.json` (keys starting with `//` are comments):
 | `default_engine` | `parakeet` | Model picker / CLI default (English live). Use `sensevoice` for Cantonese. |
 | `parakeet_feed_sec` | `0.4` | Audio seconds per Parakeet `add_audio` (~0.3–0.5). |
 | `post_final_cooldown_sec` | `1.25` | Discard mic audio after each final (echo/self-print). |
+| `post_stop_polish` | `true` | On stop, re-decode the whole recorded session in one batch pass and replace the transcript. |
 | `mic_blocksize` | `4096` | sounddevice frames @ 16 kHz (fewer Python wakeups). |
 | `vad_min_rms` | `0.02` | Speech energy gate passed by the live engines. |
 | `min_final_chars` | `8` | Prefer not emitting tiny Parakeet finals unless punctuated. |

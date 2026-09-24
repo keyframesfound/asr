@@ -8,6 +8,9 @@
   "// post_final_cooldown_sec": "Seconds the live engines discard mic audio after each committed final (cuts self-echo / reprint). 0 disables. Useful range about 0.8–1.5.",
   "post_final_cooldown_sec": 1.25,
 
+  "// post_stop_polish": "After stopping live, re-decode the whole recorded session in one batch pass (full-utterance context, like a push-to-talk dictation app) and replace the transcript. Records raw mic audio during live. On speakers (no headphones) room echo lands in that recording — set false if polish output duplicates lines.",
+  "post_stop_polish": true,
+
   "// mic_blocksize": "sounddevice frames per callback at 16 kHz (~3200–4096 cuts Python wakeups; keep latency reasonable).",
   "mic_blocksize": 4096,
 

@@ -23,6 +23,7 @@ from textual.timer import Timer
 from textual.widgets import Button, Input, ListItem, ListView, RichLog, Static
 
 from engines import level as level_bus
+from engines.audio_util import is_cjk as _is_cjk
 from engines.config import load_audio_config, load_config, save_config
 
 # Patch tqdm before any engine load — Textual FDs break multiprocessing locks.
@@ -39,7 +40,6 @@ ROOT = Path(__file__).resolve().parent
 _STATUS_LISTENING = ("listening…", "listening...", "listening")
 _STATUS_TRANSCRIBING = ("transcribing…", "transcribing...", "transcribing")
 _STATUS_LOADING_PREFIXES = ("loading ", "ready (")
-
 # Accent: calm amber (used sparingly — LIVE chip, focus row, key glyphs)
 _ACCENT = "#e8a87c"
 _MUTED = "#6b6b6b"
@@ -133,7 +133,7 @@ def _pick_save_path(default_name: str) -> Path | None:
 
 
 def _classify_partial(text: str) -> str:
-    """Return 'listening' | 'transcribing' | 'loading' | 'draft'."""
+    """Return 'listening' | 'transcribing' | 'polishing' | 'loading' | 'draft'."""
     t = (text or "").strip()
     low = t.lower()
     if not t:
@@ -142,6 +142,8 @@ def _classify_partial(text: str) -> str:
         return "listening"
     if low in _STATUS_TRANSCRIBING:
         return "transcribing"
+    if low.startswith("polishing"):
+        return "polishing"
     if any(low.startswith(p) for p in _STATUS_LOADING_PREFIXES):
         return "loading"
     return "draft"
@@ -152,19 +154,6 @@ def _clock_str() -> str:
 
 
 # —— caption reveal: pure helpers (unit-tested) ——
-
-def _is_cjk(ch: str) -> bool:
-    o = ord(ch)
-    return (
-        0x3000 <= o <= 0x303F  # CJK punctuation
-        or 0x3040 <= o <= 0x30FF  # kana
-        or 0x3400 <= o <= 0x4DBF  # CJK ext A
-        or 0x4E00 <= o <= 0x9FFF  # CJK unified
-        or 0xF900 <= o <= 0xFAFF  # CJK compatibility
-        or 0xFF00 <= o <= 0xFFEF  # fullwidth forms
-        or 0x20000 <= o <= 0x2FA1F  # CJK ext B–F
-    )
-
 
 def _tokenize(text: str) -> list[str]:
     """Split into reveal chunks: latin words (trailing space attached), one CJK char each.
@@ -210,6 +199,13 @@ def _plan_reveal(shown: str, target: str) -> tuple[str, list[str]]:
         acc += len(toks[idx])
         idx += 1
     return "".join(toks[:idx]), toks[idx:]
+
+
+def _export_body(lines: list[str]) -> str:
+    """Transcript file body: plain text lines, one final per line."""
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
 
 
 def _copy_to_clipboard(text: str) -> bool:
@@ -304,16 +300,19 @@ class FinalText(Message):
 
 
 class SessionDone(Message):
-    def __init__(self, summary: str, error: str | None = None) -> None:
+    def __init__(
+        self,
+        summary: str,
+        error: str | None = None,
+        *,
+        polished: str | None = None,
+        recorded_sec: float = 0.0,
+    ) -> None:
         super().__init__()
         self.summary = summary
         self.error = error
-
-
-@dataclass
-class TranscriptLine:
-    ts: datetime
-    text: str
+        self.polished = polished
+        self.recorded_sec = recorded_sec
 
 
 class TopBar(Static):
@@ -395,10 +394,11 @@ def _rms_to_level(rms: float) -> float:
 
 
 class LevelMeter(Static):
-    """Slim live mic row: device · level bar · dB · transcript counts.
+    """Slim live mic row: state dot · level bar · dB · transcript counts.
 
     Reads engines.level (fed by the sounddevice callback) so it works for
-    every engine without touching their loops.
+    every engine without touching their loops. A solid ● means audio is
+    arriving from the mic; ○ means idle/no signal.
     """
 
     BAR_SLOTS = 30
@@ -407,24 +407,15 @@ class LevelMeter(Static):
     def __init__(self, **kwargs) -> None:
         super().__init__("", id=kwargs.pop("id", "meter"), **kwargs)
         self._smooth = 0.0
-        self._device = "—"
         self._counts = (0, 0)
 
     def on_mount(self) -> None:
         self.set_interval(1 / 15, self._tick)
 
-    def set_device(self, name: str | None) -> None:
-        self._device = (name or "—").strip() or "—"
-
     def set_counts(self, lines: int, words: int) -> None:
         self._counts = (lines, words)
 
     def _tick(self) -> None:
-        from engines.mic import last_input_choice
-
-        choice = last_input_choice()
-        if choice is not None:
-            self._device = choice.name
         rms, peak, ts, clipped = level_bus.snapshot()
         fresh = ts > 0.0 and (time.monotonic() - ts) < self.STALE_SEC
         target = _rms_to_level(rms) if fresh else 0.0
@@ -440,9 +431,11 @@ class LevelMeter(Static):
 
     def _render_row(self, fresh: bool, peak_level: float, db: int | None, clipped: bool) -> Text:
         row = Text()
-        row.append("mic ", style=_MUTED)
-        row.append(self._device[:24], style="#9a9a9a")
-        row.append("  ", style=_MUTED)
+        if fresh:
+            row.append("●", style="bold #e05c5c" if clipped else f"bold {_ACCENT}")
+        else:
+            row.append("○", style=_MUTED)
+        row.append(" ", style=_MUTED)
 
         filled = round(self._smooth * self.BAR_SLOTS)
         peak_idx = round(peak_level * self.BAR_SLOTS)
@@ -454,15 +447,15 @@ class LevelMeter(Static):
                 elif frac >= 0.7:
                     color = _ACCENT
                 else:
-                    color = "#6b6b6b"
+                    color = "#8a8a8a"
                 row.append("█", style=color)
             elif i == peak_idx and i >= filled and peak_level > 0.01:
                 row.append("▍", style=_ACCENT)  # peak-hold tick
             else:
-                row.append("·", style="#242424")
+                row.append("·", style="#2e2e2e")
 
         if fresh and db is not None:
-            row.append(f"  {db:>3} dB", style=_MUTED)
+            row.append(f"  {db:>3} dB", style=_SECONDARY)
         else:
             row.append("  — dB", style="#3a3a3a")
         if clipped:
@@ -658,10 +651,10 @@ class ListeningScreen(Screen):
         # as soon as live ASR is toggled off.
         self._session_running = False
         self._opt = next(o for o in ENGINES if o.code == engine_code)
-        self._lines: list[TranscriptLine] = []
+        self._lines: list[str] = []
         self._caption = ""
         self._words = 0
-        # listening | transcribing | live | stopped | loading
+        # listening | transcribing | polishing | live | stopped | loading
         self._ui_state = "stopped"
 
     def compose(self) -> ComposeResult:
@@ -689,7 +682,7 @@ class ListeningScreen(Screen):
             yield ActionButton("Models", id="btn-models")
             yield ActionButton("Settings", id="btn-settings")
             yield Static(
-                "keys: space live · e export · s settings · d mic · m models · q quit",
+                "space live · e export · s settings · d mic · m models",
                 id="bar-hint",
             )
 
@@ -728,13 +721,27 @@ class ListeningScreen(Screen):
     def _btn_settings(self) -> None:
         self.action_settings()
 
+    def _mic_name(self) -> str:
+        """Mic actually opened by the last session ('unknown mic' before that)."""
+        try:
+            from engines.mic import last_input_choice
+
+            choice = last_input_choice()
+            if choice is not None and choice.name:
+                return choice.name
+        except Exception:
+            pass
+        return "unknown mic"
+
     def _set_status_line(self, state: str, detail: str = "") -> None:
         self._ui_state = state
         status = self.query_one("#status", Static)
         if state == "listening":
-            status.update(Text("listening", style=f"italic {_MUTED}"))
+            status.update(Text(f"listening · {self._mic_name()}", style="#9a9a9a"))
         elif state == "transcribing":
             status.update(Text("transcribing…", style=f"italic {_SECONDARY}"))
+        elif state == "polishing":
+            status.update(Text("polishing full-session audio…", style=f"italic {_SECONDARY}"))
         elif state == "live":
             preview = detail if len(detail) <= 80 else detail[:77] + "…"
             status.update(
@@ -784,12 +791,12 @@ class ListeningScreen(Screen):
         engine_code = self.engine_code
 
         def on_partial(text: str) -> None:
-            if not self._stop.is_set():
-                app.call_from_thread(self.post_message, PartialText(text))
+            # No stop guard: engines emit the "Polishing…" status after stop,
+            # and the engine itself honors stop_event before anything else.
+            app.call_from_thread(self.post_message, PartialText(text))
 
         def on_final(text: str) -> None:
-            if not self._stop.is_set():
-                app.call_from_thread(self.post_message, FinalText(text))
+            app.call_from_thread(self.post_message, FinalText(text))
 
         def worker() -> None:
             try:
@@ -801,7 +808,12 @@ class ListeningScreen(Screen):
                 summary = engine.run(on_partial, on_final, stop_event=self._stop)
                 app.call_from_thread(
                     self.post_message,
-                    SessionDone(summary.short_text(), summary.error),
+                    SessionDone(
+                        summary.short_text(),
+                        summary.error,
+                        polished=getattr(summary, "polished", None),
+                        recorded_sec=float(getattr(summary, "recorded_sec", 0.0) or 0.0),
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001
                 app.call_from_thread(
@@ -867,7 +879,7 @@ class ListeningScreen(Screen):
         if not self._lines:
             self._flash("nothing to copy yet", color=_MUTED)
             return
-        text = self._lines[-1].text
+        text = self._lines[-1]
         if _copy_to_clipboard(text):
             self._flash(f"copied — {text[:60]}{'…' if len(text) > 60 else ''}")
         else:
@@ -897,11 +909,7 @@ class ListeningScreen(Screen):
             return
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            body = "\n".join(
-                f"[{line.ts.strftime('%Y-%m-%d %H:%M:%S')}] {line.text}"
-                for line in self._lines
-            )
-            path.write_text(body + "\n", encoding="utf-8")
+            path.write_text(_export_body(self._lines), encoding="utf-8")
             self.query_one("#status", Static).update(
                 Text(f"exported → {path}", style=_SECONDARY)
             )
@@ -926,6 +934,10 @@ class ListeningScreen(Screen):
             self._set_status_line("transcribing")
             self._set_caption_indicator("transcribing")
             self.query_one("#partial", Static).update("~ Transcribing…")
+        elif kind == "polishing":
+            self._set_status_line("polishing")
+            self.query_one("#partial", Static).update("")
+            # Caption keeps the last speech — polish replaces it when done.
         elif kind == "loading":
             self._set_status_line("loading", event.text)
             self.query_one("#partial", Static).update(f"~ {event.text}")
@@ -941,21 +953,33 @@ class ListeningScreen(Screen):
         if not text:
             return
         self.query_one("#partial", Static).update("")
-        self._lines.append(TranscriptLine(ts=datetime.now(), text=text))
+        self._lines.append(text)
         self._words += len(text.split())
         self.query_one("#meter", LevelMeter).set_counts(len(self._lines), self._words)
-        # Settle caption to final text; log gets the timestamped line.
+        # Settle caption to final text; log gets the plain line (no timestamps).
         self._set_caption_indicator("final", text)
         self._set_status_line("listening")  # ready for next utterance after final
-        self.query_one("#transcript", RichLog).write(
-            f"[dim]{datetime.now().strftime('%H:%M:%S')}[/]  {escape(text)}"
-        )
+        self.query_one("#transcript", RichLog).write(escape(text))
 
     @on(SessionDone)
     def session_done(self, event: SessionDone) -> None:
         self._set_live_ui(False)
-        # Caption keeps the last text; nothing is wiped by a stop.
         log = self.query_one("#transcript", RichLog)
+        polished = (event.polished or "").strip()
+        if polished and not event.error and self._lines:
+            # Full-session re-decode won: replace the live transcript with it.
+            self._lines = [polished]
+            self._words = len(polished.split())
+            self.query_one("#meter", LevelMeter).set_counts(1, self._words)
+            log.clear()
+            log.write(escape(polished))
+            self._set_caption_indicator("final", polished)
+            secs = f"{event.recorded_sec:.0f}s" if event.recorded_sec else "session"
+            self._set_status_line(
+                "stopped", f"polished — full audio re-decoded ({secs})"
+            )
+            return
+        # Caption keeps the last text; nothing is wiped by a stop.
         if event.error:
             short = str(event.error).split(". ")[0].rstrip(".")
             self._set_status_line("stopped", f"error — {short} · full text in log")
@@ -1302,9 +1326,10 @@ class AudioLiveApp(App[None]):
     }
     #bar-hint {
         width: 1fr;
+        min-width: 0;
         height: 3;
         padding: 0 1;
-        content-align: right middle;
+        content-align: left middle;
         color: #5a5a5a;
     }
 

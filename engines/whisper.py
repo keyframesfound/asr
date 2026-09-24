@@ -13,7 +13,13 @@ os.environ["TQDM_DISABLE"] = "1"
 
 import numpy as np
 
-from .audio_util import chunk_rms, prepare_chunk
+from .audio_util import (
+    chunk_rms,
+    join_transcript_parts,
+    plan_silent_chunks,
+    polish_session,
+    prepare_chunk,
+)
 from .config import load_config
 from .base import LiveEngine, OnFinal, OnPartial, SessionSummary
 from .mic import open_input_stream
@@ -135,6 +141,36 @@ def _is_junk(text: str) -> bool:
 class WhisperTurboEngine(LiveEngine):
     name = "Whisper Large V3 Turbo"
 
+    def polish(
+        self, audio: np.ndarray, *, sample_rate: int = 16000
+    ) -> str | None:
+        """Re-decode the whole session in one pass, snapped to speech pauses."""
+        if _MODEL is None or _PROCESSOR is None or audio.size < sample_rate:
+            return None
+        import torch
+
+        min_rms = float(load_config().get("vad_min_rms", WHISPER_MIN_RMS))
+        pieces: list[str] = []
+        for start, end in plan_silent_chunks(audio, sample_rate, max_sec=28.0):
+            seg = prepare_chunk(audio[start:end], min_rms=min_rms)
+            if seg is None:
+                continue
+            inputs = _PROCESSOR(seg, sampling_rate=sample_rate, return_tensors="pt")
+            input_features = inputs.input_features.to(device=_DEVICE, dtype=_DTYPE)
+            with torch.inference_mode():
+                predicted_ids = _MODEL.generate(
+                    input_features,
+                    language="en",
+                    task="transcribe",
+                    condition_on_prev_tokens=False,
+                    use_cache=False,
+                )
+            text = _PROCESSOR.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+            text = (text or "").strip()
+            if text and not _is_junk(text):
+                pieces.append(text)
+        return join_transcript_parts(pieces) or None
+
     def run(
         self,
         on_partial: OnPartial,
@@ -195,6 +231,8 @@ class WhisperTurboEngine(LiveEngine):
         stop = stop_event or threading.Event()
         need = int(CHUNK_SEC * sample_rate)
         buf = np.zeros(0, dtype=np.float32)
+        # Raw session recording for the post-stop polish pass.
+        session: list[np.ndarray] = []
         cool_until = 0.0
         last_final = ""
 
@@ -209,6 +247,7 @@ class WhisperTurboEngine(LiveEngine):
                     block = q.get(timeout=0.2)
                 except queue.Empty:
                     continue
+                session.append(block.reshape(-1).astype(np.float32))
                 now = time.monotonic()
                 if now < cool_until:
                     # Drop bleed / self-echo while cooldown is active.
@@ -260,4 +299,11 @@ class WhisperTurboEngine(LiveEngine):
                 stream.close()
             except Exception:
                 pass
+        polish_session(
+            self,
+            session,
+            sample_rate=sample_rate,
+            on_partial=on_partial,
+            summary=summary,
+        )
         return summary

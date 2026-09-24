@@ -9,7 +9,12 @@ from pathlib import Path
 
 import numpy as np
 
-from .audio_util import prepare_chunk
+from .audio_util import (
+    join_transcript_parts,
+    plan_silent_chunks,
+    polish_session,
+    prepare_chunk,
+)
 from .base import LiveEngine, OnFinal, OnPartial, SessionSummary
 from .config import load_config
 from .mic import open_input_stream
@@ -260,6 +265,32 @@ def _should_emit_final(delta: str, min_chars: int) -> bool:
 class ParakeetEngine(LiveEngine):
     name = "Parakeet Unified EN"
 
+    def polish(
+        self, audio: np.ndarray, *, sample_rate: int = 16000
+    ) -> str | None:
+        """Batch-decode the whole session with the warm model.
+
+        Full-utterance context — the accuracy a push-to-talk dictation app
+        gets: every millisecond of raw mic audio, decoded in one pass with
+        pause-snapped pieces for long recordings. Runs on this worker's GPU
+        stream while the worker lock is still held.
+        """
+        if _MODEL is None or _MODEL_STREAM is None or audio.size < sample_rate:
+            return None
+        import mlx.core as mx
+        from parakeet_mlx.audio import get_logmel
+
+        model, stream = _MODEL, _MODEL_STREAM
+        pieces: list[str] = []
+        with mx.stream(stream):
+            for start, end in plan_silent_chunks(audio, sample_rate, max_sec=100.0):
+                mel = get_logmel(mx.array(audio[start:end]), model.preprocessor_config)
+                result = model.generate(mel)[0]
+                text = (getattr(result, "text", "") or "").strip()
+                if text:
+                    pieces.append(text)
+        return join_transcript_parts(pieces) or None
+
     def run(
         self,
         on_partial: OnPartial,
@@ -330,6 +361,9 @@ class ParakeetEngine(LiveEngine):
         stop = stop_event or threading.Event()
         need = max(1, int(feed_sec * sample_rate))
         buf = np.zeros(0, dtype=np.float32)
+        # Every raw mic block, kept out of the live path's gating/cooldown so
+        # the post-stop polish pass can re-decode the complete session.
+        session: list[np.ndarray] = []
         stream_mic, q = open_input_stream(sample_rate=sample_rate, blocksize=blocksize)
         stream_mic.start()
         on_partial("Listening…")
@@ -347,6 +381,7 @@ class ParakeetEngine(LiveEngine):
                             block = q.get(timeout=0.2)
                         except queue.Empty:
                             continue
+                        session.append(block.reshape(-1).astype(np.float32))
                         now = time.monotonic()
                         if now < cool_until:
                             # Discard mic during post-final echo cooldown.
@@ -415,4 +450,11 @@ class ParakeetEngine(LiveEngine):
                 stream_mic.close()
             except Exception:
                 pass
+        polish_session(
+            self,
+            session,
+            sample_rate=sample_rate,
+            on_partial=on_partial,
+            summary=summary,
+        )
         return summary

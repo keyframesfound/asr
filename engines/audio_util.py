@@ -6,8 +6,9 @@
 """
 from __future__ import annotations
 
+import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 import numpy as np
 
@@ -15,7 +16,10 @@ from .config import (
     DEFAULT_MIN_RMS,
     DEFAULT_TARGET_RMS,
     load_audio_config,
+    load_config,
 )
+
+logger = logging.getLogger("engines.audio_util")
 
 # Public aliases. Prefer config.json; these match the built-in fallbacks.
 MIN_RMS = DEFAULT_MIN_RMS
@@ -133,3 +137,121 @@ def accept_input_block(
     if buf.size == 0:
         return np.ascontiguousarray(flat)
     return np.concatenate([buf, flat])
+
+
+# —— full-session polish (batch re-decode on stop) ——
+
+def is_cjk(ch: str) -> bool:
+    """True for CJK punctuation / kana / hanzi ranges (shared with the TUI)."""
+    o = ord(ch)
+    return (
+        0x3000 <= o <= 0x303F  # CJK punctuation
+        or 0x3040 <= o <= 0x30FF  # kana
+        or 0x3400 <= o <= 0x4DBF  # CJK ext A
+        or 0x4E00 <= o <= 0x9FFF  # CJK unified
+        or 0xF900 <= o <= 0xFAFF  # CJK compatibility
+        or 0xFF00 <= o <= 0xFFEF  # fullwidth forms
+        or 0x20000 <= o <= 0x2FA1F  # CJK ext B–F
+    )
+
+
+def join_transcript_parts(parts: Iterable[str]) -> str:
+    """Join piecewise decode output: no space across a CJK seam, one otherwise."""
+    out = ""
+    for part in parts:
+        p = (part or "").strip()
+        if not p:
+            continue
+        if not out:
+            out = p
+        elif is_cjk(out[-1]) or is_cjk(p[0]):
+            out += p
+        else:
+            out += " " + p
+    return out
+
+
+def plan_silent_chunks(
+    audio: np.ndarray,
+    sr: int,
+    *,
+    max_sec: float,
+    min_sec: float = 4.0,
+) -> list[tuple[int, int]]:
+    """Window ``[0, len)`` into pieces ≤ max_sec that end at the quietest stretch.
+
+    Each boundary snaps to the lowest-RMS 0.25 s window inside the last
+    ``min_sec`` seconds of the candidate chunk, so long-session re-decodes do
+    not cut words mid-syllable. Pure numpy — no model, no audio leaves range.
+    """
+    a = np.asarray(audio, dtype=np.float32).reshape(-1)
+    total = a.size
+    if total == 0:
+        return []
+    frame = max(1, int(0.05 * sr))
+    span = max(1, (int(0.25 * sr)) // frame)
+    n_frames = total // frame
+    if n_frames == 0:
+        return [(0, total)]
+    frames = a[: n_frames * frame].reshape(n_frames, frame)
+    rms = np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1))
+    cum = np.concatenate([[0.0], np.cumsum(rms)])
+    min_frames = max(1, (int(min_sec * sr)) // frame)
+    max_frames = max(min_frames + 1, (int(max_sec * sr)) // frame)
+
+    chunks: list[tuple[int, int]] = []
+    pos = 0
+    while pos < total:
+        if total - pos <= max_frames * frame:
+            chunks.append((pos, total))
+            break
+        hard = pos + max_frames * frame
+        lo = (pos + min_frames * frame) // frame
+        hi = hard // frame - span
+        if hi > lo:
+            starts = np.arange(lo, hi)
+            vals = (cum[starts + span] - cum[starts]) / span
+            boundary = int(starts[int(np.argmin(vals))]) * frame
+        else:
+            boundary = hard
+        chunks.append((pos, int(boundary)))
+        pos = int(boundary)
+    return chunks
+
+
+def polish_enabled() -> bool:
+    """config.json ``post_stop_polish`` — re-decode the whole session on stop."""
+    return bool(load_config().get("post_stop_polish", True))
+
+
+def polish_session(
+    engine,
+    blocks: list[np.ndarray],
+    *,
+    sample_rate: int,
+    on_partial: Callable[[str], None],
+    summary,
+    min_sec: float = 1.0,
+) -> None:
+    """Best-effort full-session re-decode after a live stop.
+
+    ``blocks`` are the raw mic audio recorded before any gating or echo
+    cooldown, so the polish pass sees exactly what a batch dictation app
+    would have seen. Failures are logged and the live transcript stands.
+    """
+    if not polish_enabled() or summary.error or not blocks:
+        return
+    audio = np.concatenate(
+        [np.asarray(b, dtype=np.float32).reshape(-1) for b in blocks]
+    )
+    recorded_sec = audio.size / float(sample_rate)
+    if recorded_sec < min_sec:
+        return
+    summary.recorded_sec = recorded_sec
+    try:
+        on_partial("Polishing session audio…")
+        text = engine.polish(audio, sample_rate=sample_rate)
+        if text and text.strip():
+            summary.polished = text.strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("session polish failed (%s); keeping live transcript", exc)

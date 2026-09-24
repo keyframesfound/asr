@@ -3,6 +3,11 @@
 TopBar used to store its label on ``_context``, which shadows
 ``MessagePump._context`` (a context manager). The pump then died with
 ``TypeError: 'str' object is not callable`` and the first paint stayed blank.
+ListeningScreen._running had the same collision with the pump's running flag
+(renamed to ``_session_running``).
+
+Adapted for the current design: the listening screen's bottom chrome is the
+clickable action bar (#action-bar + #bar-hint), not a keyhint row.
 """
 from __future__ import annotations
 
@@ -14,8 +19,10 @@ from textual.widget import Widget
 
 from tui_app import (
     ENGINES,
+    ActionButton,
     AudioLiveApp,
     KeyHint,
+    LevelMeter,
     ListeningScreen,
     ModelPickerScreen,
     TopBar,
@@ -31,14 +38,19 @@ def _plain(widget: Widget) -> str:
 
 
 def _visible_model_titles(screen) -> list[str]:
-    """Titles whose row intersects the list viewport (not scrolled off-screen)."""
+    """Titles whose row intersects the list viewport (not scrolled off-screen).
+
+    The current-row default marker ("  · default") is stripped so the
+    assertion is about the engine names themselves.
+    """
     models = screen.query_one("#model-list")
     top = models.region.y
     bottom = models.region.y + models.region.height
     found: list[str] = []
     for item in models.children:
         if item.region.y < bottom and item.region.y + item.region.height > top:
-            found.append(_plain(item.query_one(".model-title")))
+            title = _plain(item.query_one(".model-title"))
+            found.append(title.split("  ·")[0].strip())
     return found
 
 
@@ -117,23 +129,33 @@ class TuiChromeTest(unittest.IsolatedAsyncioTestCase):
 
             top = screen.query_one("#top-bar", TopBar)
             caption = screen.query_one("#caption")
-            hint = screen.query_one("#keyhint", KeyHint)
+            meter = screen.query_one("#meter", LevelMeter)
             status = screen.query_one("#status")
+            bar = screen.query_one("#action-bar")
+            btn_live = screen.query_one("#btn-live", ActionButton)
 
             for widget, label in (
                 (top, "top-bar"),
                 (caption, "caption"),
-                (hint, "keyhint"),
+                (meter, "meter"),
                 (status, "status"),
+                (bar, "action-bar"),
+                (btn_live, "btn-live"),
             ):
                 self.assertGreater(widget.size.width, 0, label)
                 self.assertGreater(widget.size.height, 0, label)
+            # bar-hint may legitimately collapse to 0 at 80 cols; the
+            # wide-terminal test below asserts its visibility.
 
             self.assertIn("asr", _plain(top))
             self.assertIn("Parakeet Unified EN", _plain(top))
             self.assertIn("Listening", _plain(caption))
-            self.assertIn("space", _plain(hint))
-            self.assertIn("export", _plain(hint))
+            # The meter shows the idle dot until audio arrives, plus a dB slot.
+            self.assertIn("○", _plain(meter))
+            self.assertIn("dB", _plain(meter))
+            # Bottom hints live in the action bar row; status carries the mic.
+            self.assertIn("Stop", str(btn_live.label))  # session is live here
+            self.assertIsNotNone(screen.query_one("#bar-hint"))
 
             # Stopping the session must not clear the message-pump flag.
             self.assertTrue(screen.is_running)
@@ -142,6 +164,28 @@ class TuiChromeTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(screen._session_running)
             self.assertTrue(screen.is_running)
             self.assertTrue(callable(screen._context))
+            self.assertIn("Live", str(btn_live.label))  # back to start state
+
+    async def test_listening_keyboard_hints_fit_wide_terminal(self) -> None:
+        """At 80 cols the buttons fill the bar; the hint text needs real width."""
+        app = AudioLiveApp()
+
+        def _quiet_start(screen: ListeningScreen) -> None:
+            screen._set_live_ui(True)
+
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            screen = ListeningScreen("parakeet")
+            with mock.patch.object(ListeningScreen, "_start_engine", _quiet_start):
+                await app.push_screen(screen)
+            await pilot.pause()
+
+            hint = screen.query_one("#bar-hint")
+            self.assertGreater(hint.size.width, 40, "keyboard hints visible")
+            plain = _plain(hint)
+            self.assertIn("space", plain)
+            self.assertIn("export", plain)
+            self.assertIn("settings", plain)
 
 
 if __name__ == "__main__":

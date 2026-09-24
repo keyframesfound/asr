@@ -9,7 +9,13 @@ from pathlib import Path
 
 import numpy as np
 
-from .audio_util import chunk_rms, prepare_chunk
+from .audio_util import (
+    chunk_rms,
+    join_transcript_parts,
+    plan_silent_chunks,
+    polish_session,
+    prepare_chunk,
+)
 from .config import load_config
 from .base import LiveEngine, OnFinal, OnPartial, SessionSummary
 from .mic import open_input_stream
@@ -88,6 +94,24 @@ def _extract_text(out) -> str:
 class SenseVoiceEngine(LiveEngine):
     name = "SenseVoice"
 
+    def polish(
+        self, audio: np.ndarray, *, sample_rate: int = 16000
+    ) -> str | None:
+        """Re-decode the whole session in one pass, snapped to speech pauses."""
+        if _MODEL is None or audio.size < sample_rate:
+            return None
+        min_rms = float(load_config().get("vad_min_rms", 0.02))
+        pieces: list[str] = []
+        for start, end in plan_silent_chunks(audio, sample_rate, max_sec=25.0):
+            seg = prepare_chunk(audio[start:end], min_rms=min_rms)
+            if seg is None:
+                continue
+            out = _MODEL.generate(input=seg, cache={}, language=LANGUAGE, use_itn=True)
+            text = _extract_text(out)
+            if text:
+                pieces.append(text)
+        return join_transcript_parts(pieces) or None
+
     def run(
         self,
         on_partial: OnPartial,
@@ -144,6 +168,8 @@ class SenseVoiceEngine(LiveEngine):
         stop = stop_event or threading.Event()
         need = int(CHUNK_SEC * sample_rate)
         buf = np.zeros(0, dtype=np.float32)
+        # Raw session recording for the post-stop polish pass.
+        session: list[np.ndarray] = []
         cool_until = 0.0
         stream, q = open_input_stream(sample_rate=sample_rate, blocksize=blocksize)
         stream.start()
@@ -155,6 +181,7 @@ class SenseVoiceEngine(LiveEngine):
                     block = q.get(timeout=0.2)
                 except queue.Empty:
                     continue
+                session.append(block.reshape(-1).astype(np.float32))
                 now = time.monotonic()
                 if now < cool_until:
                     buf = np.zeros(0, dtype=np.float32)
@@ -206,4 +233,11 @@ class SenseVoiceEngine(LiveEngine):
                         on_final(text)
                 except Exception as exc:
                     summary.error = str(exc)
+        polish_session(
+            self,
+            session,
+            sample_rate=sample_rate,
+            on_partial=on_partial,
+            summary=summary,
+        )
         return summary
