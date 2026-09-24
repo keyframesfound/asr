@@ -46,6 +46,18 @@ python main.py
 
 Caption shows **Listening…** / **Transcribing…**, then drafts; finals land in the dim-timestamped log.
 
+### Hong Kong CJK font（繁體中文・香港）
+
+Captions and the transcript log use the terminal’s font. Textual CSS cannot set a typeface (`font-family` is rejected as an invalid property, and the TUI will not start), so this app does not declare one.
+
+For Hong Kong Traditional Chinese, point **Terminal.app** at **PingFang HK**（蘋方-港）. If that face is missing, use **Noto Sans HK**, then **Noto Sans TC**.
+
+1. Terminal → **Settings…**（設定，⌘,）→ **Profiles**（描述檔）→ **Text**（文字）.
+2. Under Font（字體）, click **Change…** and choose **PingFang HK**, Regular or Medium, about 14–16 pt.
+3. Open a new window so the profile font applies, then run `./run`.
+
+If borders look uneven, set character spacing to 1 and nudge line spacing (about 0.8). To screenshot-check, leave PingFang HK selected, start a listening session, and capture the view while a Chinese line is on the caption or in the log.
+
 ### Legacy non-TUI CLI
 
 ```bash

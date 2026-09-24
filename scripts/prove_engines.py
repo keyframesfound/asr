@@ -64,21 +64,23 @@ def main() -> int:
         from engines.audio_util import prepare_chunk
 
         print("\n[SenseVoice] loading…")
+        # Same user-facing path as live finals: language=yue, tag strip, OpenCC s2hk.
+        # No golden audio transcript yet. If one is added, expect 香港繁體
+        # (e.g. 這個軟件裏面), not Simplified. s2hk is not a Cantonese
+        # lexical rewrite: 係/嘅/唔/咗 stay as the model emitted them.
+        hk = sensevoice._extract_text(
+            [{"text": "<|yue|><|NEUTRAL|>这个软件里面有汉字"}]
+        )
+        if hk != "這個軟件裏面有漢字" or "<|" in hk:
+            raise RuntimeError(f"香港繁體 postprocess mismatch: {hk!r}")
         print(sensevoice.preload())
         chunk = prepare_chunk(audio)
         if chunk is None:
             chunk = audio.astype(np.float32)
         out = sensevoice._MODEL.generate(
-            input=chunk, cache={}, language="auto", use_itn=True
+            input=chunk, cache={}, language=sensevoice.LANGUAGE, use_itn=True
         )
-        if isinstance(out, list) and out:
-            text = str(
-                out[0].get("text") if isinstance(out[0], dict) else out[0]
-            ).strip()
-        elif isinstance(out, dict):
-            text = str(out.get("text") or "").strip()
-        else:
-            text = str(out or "").strip()
+        text = sensevoice._extract_text(out)
         if not text:
             raise RuntimeError("empty transcript")
         results["SenseVoice"] = text
