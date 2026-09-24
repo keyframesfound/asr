@@ -1,7 +1,11 @@
 """Interactive TUI for asr (Textual) — Claude Code / OpenCode inspired."""
 from __future__ import annotations
 
+import math
+import shutil
+import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -14,8 +18,12 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.screen import Screen
-from textual.widgets import Label, ListItem, ListView, RichLog, Static
+from textual.screen import ModalScreen, Screen
+from textual.timer import Timer
+from textual.widgets import Button, Input, ListItem, ListView, RichLog, Static
+
+from engines import level as level_bus
+from engines.config import load_audio_config, load_config, save_config
 
 # Patch tqdm before any engine load — Textual FDs break multiprocessing locks.
 try:
@@ -143,6 +151,140 @@ def _clock_str() -> str:
     return datetime.now().strftime("%H:%M")
 
 
+# —— caption reveal: pure helpers (unit-tested) ——
+
+def _is_cjk(ch: str) -> bool:
+    o = ord(ch)
+    return (
+        0x3000 <= o <= 0x303F  # CJK punctuation
+        or 0x3040 <= o <= 0x30FF  # kana
+        or 0x3400 <= o <= 0x4DBF  # CJK ext A
+        or 0x4E00 <= o <= 0x9FFF  # CJK unified
+        or 0xF900 <= o <= 0xFAFF  # CJK compatibility
+        or 0xFF00 <= o <= 0xFFEF  # fullwidth forms
+        or 0x20000 <= o <= 0x2FA1F  # CJK ext B–F
+    )
+
+
+def _tokenize(text: str) -> list[str]:
+    """Split into reveal chunks: latin words (trailing space attached), one CJK char each.
+
+    ``"".join(_tokenize(t)) == t`` always holds.
+    """
+    tokens: list[str] = []
+    buf: list[str] = []
+    for ch in text:
+        if _is_cjk(ch):
+            if buf:
+                tokens.append("".join(buf))
+                buf.clear()
+            tokens.append(ch)
+        elif ch.isspace():
+            buf.append(ch)
+            tokens.append("".join(buf))
+            buf.clear()
+        else:
+            buf.append(ch)
+    if buf:
+        tokens.append("".join(buf))
+    return tokens
+
+
+def _plan_reveal(shown: str, target: str) -> tuple[str, list[str]]:
+    """Diff a caption update into (stable base, chunks still to animate).
+
+    Pure append keeps every shown char in place (no flashing); a rewrite only
+    moves text after the longest token-aligned common prefix.
+    """
+    if target.startswith(shown):
+        return shown, _tokenize(target[len(shown) :])
+    k = 0
+    for a, b in zip(shown, target):
+        if a != b:
+            break
+        k += 1
+    toks = _tokenize(target)
+    acc = 0
+    idx = 0
+    while idx < len(toks) and acc + len(toks[idx]) <= k:
+        acc += len(toks[idx])
+        idx += 1
+    return "".join(toks[:idx]), toks[idx:]
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    """Best-effort system clipboard (macOS/Linux/Windows); False if unsupported."""
+    for cmd in ("pbcopy", "wl-copy", "xclip", "clip.exe"):
+        if shutil.which(cmd) is None:
+            continue
+        argv = [cmd] if cmd != "xclip" else ["xclip", "-selection", "clipboard"]
+        try:
+            subprocess.run(
+                argv, input=text.encode("utf-8"), check=True, timeout=5
+            )
+            return True
+        except Exception:
+            return False
+    return False
+
+
+# —— editable settings (settings screen) ——
+
+@dataclass(frozen=True)
+class SettingSpec:
+    key: str
+    label: str
+    kind: str  # "float" | "int" | "choice"
+    lo: float = 0.0
+    hi: float = 0.0
+    choices: tuple[str, ...] = ()
+    fmt: str = "{:.2f}"
+
+
+SETTINGS: tuple[SettingSpec, ...] = (
+    SettingSpec(
+        "default_engine",
+        "Default engine",
+        "choice",
+        choices=("parakeet", "whisper", "sensevoice", "iflytek"),
+        fmt="{}",
+    ),
+    SettingSpec("parakeet_feed_sec", "Parakeet feed (s per chunk)", "float", 0.2, 1.0),
+    SettingSpec("post_final_cooldown_sec", "Post-final cooldown (s)", "float", 0.0, 5.0),
+    SettingSpec("min_final_chars", "Min chars per final", "int", 1, 64, fmt="{:d}"),
+    SettingSpec("vad_min_rms", "Speech gate (RMS)", "float", 0.0, 0.5, fmt="{:.3f}"),
+    SettingSpec("mic_blocksize", "Mic blocksize (frames)", "int", 512, 16384, fmt="{:d}"),
+    SettingSpec("cooldown_ms", "Echo cooldown (ms)", "int", 0, 5000, fmt="{:d}"),
+    SettingSpec("min_rms", "Noise floor min RMS", "float", 0.0001, 1.0, fmt="{:.4f}"),
+    SettingSpec("target_rms", "AGC target RMS", "float", 0.0001, 1.0, fmt="{:.4f}"),
+)
+
+
+def _settings_values() -> dict[str, object]:
+    """Current, validated values for every SettingSpec (engine + audio views merged)."""
+    values: dict[str, object] = dict(load_config())
+    audio = load_audio_config()
+    values["cooldown_ms"] = audio.cooldown_ms
+    values["min_rms"] = audio.min_rms
+    values["target_rms"] = audio.target_rms
+    return values
+
+
+def _parse_setting(spec: SettingSpec, raw: str) -> tuple[object | None, str | None]:
+    """Validate/clamp raw editor input. Returns (value, error); error None when valid."""
+    text = raw.strip()
+    if spec.kind == "choice":
+        if text in spec.choices:
+            return text, None
+        return None, f"choose one of: {', '.join(spec.choices)}"
+    try:
+        value: float | int = float(text) if spec.kind == "float" else int(text)
+    except ValueError:
+        return None, f"{raw!r} is not a number"
+    value = min(spec.hi, max(spec.lo, value))
+    return value, None
+
+
 class ModelPicked(Message):
     def __init__(self, code: str) -> None:
         super().__init__()
@@ -188,10 +330,12 @@ class TopBar(Static):
         self._bar_context = context
         self._show_live = show_live
         self._live = False
+        self._live_since: float | None = None
 
     def on_mount(self) -> None:
         self._render_bar()
-        self.set_interval(30.0, self._tick_clock)
+        # 1 s tick so the LIVE elapsed timer stays current.
+        self.set_interval(1.0, self._tick_clock)
 
     def _tick_clock(self) -> None:
         self._render_bar()
@@ -202,7 +346,17 @@ class TopBar(Static):
 
     def set_live(self, live: bool) -> None:
         self._live = live
+        self._live_since = time.monotonic() if live else None
         self._render_bar()
+
+    def _live_chip(self) -> Text:
+        if not self._live:
+            return Text("○ idle", style=_MUTED)
+        chip = Text("● LIVE", style="bold #e05c5c")
+        if self._live_since is not None:
+            secs = max(0, int(time.monotonic() - self._live_since))
+            chip.append(f" {secs // 60:02d}:{secs % 60:02d}", style="#e05c5c")
+        return chip
 
     def _render_bar(self) -> None:
         parts: list[Text] = [Text("asr", style=f"bold {_ACCENT}")]
@@ -211,10 +365,7 @@ class TopBar(Static):
             parts.append(Text(self._bar_context, style="#e8e8e8"))
         if self._show_live:
             parts.append(Text("  ·  ", style=_MUTED))
-            if self._live:
-                parts.append(Text("● LIVE", style="bold #e05c5c"))
-            else:
-                parts.append(Text("○ idle", style=_MUTED))
+            parts.append(self._live_chip())
         # Clock pushed right via spacer in CSS layout — append dim clock
         parts.append(Text("  ·  ", style=_MUTED))
         parts.append(Text(_clock_str(), style=_MUTED))
@@ -222,17 +373,208 @@ class TopBar(Static):
 
 
 class KeyHint(Static):
-    """Sparse bottom keyhint row."""
+    """Sparse bottom keyhint row — keys in bright chips so they stay legible."""
 
     def __init__(self, hints: list[tuple[str, str]], **kwargs) -> None:
-        # hints: [(key, label), ...]
         pieces: list[Text] = []
         for i, (key, label) in enumerate(hints):
             if i:
-                pieces.append(Text("  ·  ", style=_MUTED))
-            pieces.append(Text(key, style=f"bold {_ACCENT}"))
-            pieces.append(Text(f" {label}", style=_SECONDARY))
+                pieces.append(Text("    ", style=_MUTED))
+            pieces.append(Text(f" {key} ", style=f"bold {_ACCENT}", end=""))
+            pieces.append(Text(" ", end=""))
+            pieces.append(Text(label, style="bold #a8a8a8"))
         super().__init__(Text.assemble(*pieces), id=kwargs.pop("id", "keyhint"), **kwargs)
+
+
+def _rms_to_level(rms: float) -> float:
+    """Map RMS to 0–1 with a -60 dB floor so speech sits mid-bar."""
+    if rms <= 0.0:
+        return 0.0
+    db = 20.0 * math.log10(min(rms, 1.0))
+    return min(1.0, max(0.0, (db + 60.0) / 60.0)) ** 0.9
+
+
+class LevelMeter(Static):
+    """Slim live mic row: device · level bar · dB · transcript counts.
+
+    Reads engines.level (fed by the sounddevice callback) so it works for
+    every engine without touching their loops.
+    """
+
+    BAR_SLOTS = 30
+    STALE_SEC = 0.4
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__("", id=kwargs.pop("id", "meter"), **kwargs)
+        self._smooth = 0.0
+        self._device = "—"
+        self._counts = (0, 0)
+
+    def on_mount(self) -> None:
+        self.set_interval(1 / 15, self._tick)
+
+    def set_device(self, name: str | None) -> None:
+        self._device = (name or "—").strip() or "—"
+
+    def set_counts(self, lines: int, words: int) -> None:
+        self._counts = (lines, words)
+
+    def _tick(self) -> None:
+        from engines.mic import last_input_choice
+
+        choice = last_input_choice()
+        if choice is not None:
+            self._device = choice.name
+        rms, peak, ts, clipped = level_bus.snapshot()
+        fresh = ts > 0.0 and (time.monotonic() - ts) < self.STALE_SEC
+        target = _rms_to_level(rms) if fresh else 0.0
+        # Fast attack, slow release keeps the bar calm.
+        self._smooth = max(target, self._smooth * 0.85)
+        peak_level = _rms_to_level(peak) if fresh else 0.0
+        db = (
+            max(-60, min(0, round(20.0 * math.log10(max(rms, 1e-5)))))
+            if fresh
+            else None
+        )
+        self.update(self._render_row(fresh, peak_level, db, clipped))
+
+    def _render_row(self, fresh: bool, peak_level: float, db: int | None, clipped: bool) -> Text:
+        row = Text()
+        row.append("mic ", style=_MUTED)
+        row.append(self._device[:24], style="#9a9a9a")
+        row.append("  ", style=_MUTED)
+
+        filled = round(self._smooth * self.BAR_SLOTS)
+        peak_idx = round(peak_level * self.BAR_SLOTS)
+        for i in range(self.BAR_SLOTS):
+            frac = (i + 1) / self.BAR_SLOTS
+            if fresh and i < filled:
+                if clipped or frac >= 0.92:
+                    color = "#e05c5c"
+                elif frac >= 0.7:
+                    color = _ACCENT
+                else:
+                    color = "#6b6b6b"
+                row.append("█", style=color)
+            elif i == peak_idx and i >= filled and peak_level > 0.01:
+                row.append("▍", style=_ACCENT)  # peak-hold tick
+            else:
+                row.append("·", style="#242424")
+
+        if fresh and db is not None:
+            row.append(f"  {db:>3} dB", style=_MUTED)
+        else:
+            row.append("  — dB", style="#3a3a3a")
+        if clipped:
+            row.append("  CLIP", style="bold #e05c5c")
+        lines, words = self._counts
+        if lines:
+            row.append(f"   {lines} lines · {words} words", style="#4a4a4a")
+        return row
+
+
+class AnimatedCaption(Static):
+    """Big centered caption; each word/CJK char fades in instead of the line flashing.
+
+    Stable prefix never re-renders with a different style, so drafts that grow
+    word-by-word read as smooth typing. New chunks run dim → mid → base color
+    over ~3 ticks; long backlogs reveal faster to catch up.
+    """
+
+    TICK_SEC = 0.055
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__("", **kwargs)
+        self._base = ""  # text fully settled
+        self._shown = ""  # base + fading + pending (everything queued)
+        self._pending: list[str] = []
+        self._fading: list[list] = []  # [chunk, stage]
+        self._final = False
+        self._timer: Timer | None = None
+
+    def set_speech(self, text: str, *, final: bool = False) -> None:
+        text = (text or "").rstrip()
+        if not text:
+            return
+        append = bool(self._shown) and text.startswith(self._shown)
+        if final:
+            self._final = True
+        elif not append:
+            self._final = False
+        if not append:
+            # Rewrite: stale fade-ins no longer belong to the target.
+            self._fading.clear()
+        self._base, self._pending = _plan_reveal(self._shown, text)
+        self._shown = text
+        self._kick()
+
+    def set_status(self, text: str, *, muted: bool = False) -> None:
+        """Listening… / Transcribing… / cleared — italic, centered, no animation."""
+        self._cancel()
+        style = f"italic {_MUTED}" if muted else f"italic {_SECONDARY}"
+        self.set_class(muted or not text, "caption-empty")
+        self.set_class(True, "caption-status")
+        self.update(Align.center(Text(text, style=style), vertical="middle"))
+
+    def clear_caption(self) -> None:
+        self._cancel()
+        self.set_class(True, "caption-empty")
+        self.set_class(True, "caption-status")
+        self.update(Align.center(Text("", style=f"italic {_MUTED}"), vertical="middle"))
+
+    def _cancel(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+        self._base = ""
+        self._shown = ""
+        self._pending.clear()
+        self._fading.clear()
+        self._final = False
+
+    def _kick(self) -> None:
+        if self._timer is None:
+            self._timer = self.set_timer(self.TICK_SEC, self._tick)
+
+    def _tick(self) -> None:
+        self._timer = None
+        if self._pending:
+            step = 1 + len(self._pending) // 12  # catch up when a long draft lands
+            for _ in range(min(step, len(self._pending))):
+                self._fading.append([self._pending.pop(0), 0])
+        merged = ""
+        for chunk in self._fading:
+            chunk[1] += 1
+        still: list[list] = []
+        for chunk, stage in self._fading:
+            if stage > 1:
+                merged += chunk
+            else:
+                still.append([chunk, stage])
+        self._fading = still
+        if merged:
+            self._base += merged
+        self._render_caption()
+        if self._pending or self._fading:
+            self._kick()
+
+    def _render_caption(self) -> None:
+        base_style = "bold #e8e8e8" if self._final else "#d4d4d4"
+        shades = ("#6a6a6a", "#b0b0b0") if self._final else ("#565656", "#a4a4a4")
+        line = Text(self._base, style=base_style)
+        for chunk, stage in self._fading:
+            line.append(chunk, style=shades[min(stage, len(shades) - 1)])
+        self.set_class(False, "caption-empty")
+        self.set_class(False, "caption-status")
+        self.update(Align.center(line, vertical="middle"))
+
+
+class ActionButton(Button):
+    """Click-only button — never takes focus, so keys keep working."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.can_focus = False
 
 
 class ModelPickerScreen(Screen):
@@ -247,11 +589,15 @@ class ModelPickerScreen(Screen):
         yield TopBar("models")
         with Vertical(id="picker-wrap"):
             yield Static("Select model", id="picker-title")
+            default = default_engine_code()
             items = []
             for opt in ENGINES:
+                title = Text(opt.title, style="#e8e8e8")
+                if opt.code == default:
+                    title.append("  · default", style=f"italic {_ACCENT}")
                 item = ListItem(
                     Vertical(
-                        Static(opt.title, classes="model-title"),
+                        Static(title, classes="model-title"),
                         Static(opt.blurb, classes="model-blurb"),
                         classes="model-copy",
                     ),
@@ -294,6 +640,10 @@ class ListeningScreen(Screen):
         Binding("escape", "pick_model", "Models", show=False),
         Binding("space", "toggle_live", "Start/Stop", show=False),
         Binding("e", "export_txt", "Export", show=False),
+        Binding("s", "settings", "Settings", show=False),
+        Binding("d", "pick_device", "Mic", show=False),
+        Binding("x", "clear_transcript", "Clear", show=False),
+        Binding("c", "copy_last", "Copy", show=False),
         Binding("q", "app.quit", "Quit", show=False),
         Binding("ctrl+c", "stop_session", "Stop", show=False, priority=True),
     ]
@@ -310,15 +660,17 @@ class ListeningScreen(Screen):
         self._opt = next(o for o in ENGINES if o.code == engine_code)
         self._lines: list[TranscriptLine] = []
         self._caption = ""
+        self._words = 0
         # listening | transcribing | live | stopped | loading
         self._ui_state = "stopped"
 
     def compose(self) -> ComposeResult:
         yield TopBar(self._opt.title, show_live=True)
         with Vertical(id="listen-wrap"):
+            yield LevelMeter()
             yield Static("", id="status", classes="status-line")
             with Vertical(id="caption-stage"):
-                yield Static("", id="caption", classes="caption-empty")
+                yield AnimatedCaption(id="caption")
             yield Static("", id="stage-rule", classes="rule")
             with VerticalScroll(id="log-scroll"):
                 yield RichLog(
@@ -330,10 +682,16 @@ class ListeningScreen(Screen):
                 )
             # Hidden partial sink — engines still write here; keep for status hooks
             yield Static("", id="partial", classes="partial-hidden")
-        yield KeyHint(
-            [("space", "live"), ("e", "export"), ("m", "models"), ("q", "quit")],
-            id="keyhint",
-        )
+        with Horizontal(id="action-bar"):
+            yield ActionButton("● Live", id="btn-live")
+            yield ActionButton("Export", id="btn-export")
+            yield ActionButton("Clear all", id="btn-clear")
+            yield ActionButton("Models", id="btn-models")
+            yield ActionButton("Settings", id="btn-settings")
+            yield Static(
+                "keys: space live · e export · s settings · d mic · m models · q quit",
+                id="bar-hint",
+            )
 
     def on_mount(self) -> None:
         # Auto-start so selecting a model feels immediate; toggle can stop/restart.
@@ -345,6 +703,30 @@ class ListeningScreen(Screen):
     def _set_live_ui(self, running: bool) -> None:
         self._session_running = running
         self._top().set_live(running)
+        try:
+            self.query_one("#btn-live", ActionButton).label = "■ Stop" if running else "● Live"
+        except Exception:
+            pass  # action bar not mounted yet
+
+    @on(Button.Pressed, "#btn-live")
+    def _btn_live(self) -> None:
+        self._toggle_live()
+
+    @on(Button.Pressed, "#btn-export")
+    def _btn_export(self) -> None:
+        self._export_txt()
+
+    @on(Button.Pressed, "#btn-clear")
+    def _btn_clear(self) -> None:
+        self.action_clear_transcript()
+
+    @on(Button.Pressed, "#btn-models")
+    def _btn_models(self) -> None:
+        self.action_pick_model()
+
+    @on(Button.Pressed, "#btn-settings")
+    def _btn_settings(self) -> None:
+        self.action_settings()
 
     def _set_status_line(self, state: str, detail: str = "") -> None:
         self._ui_state = state
@@ -372,38 +754,28 @@ class ListeningScreen(Screen):
 
     def _set_caption_indicator(self, kind: str, text: str = "") -> None:
         """Update big centered caption for listening / transcribing / draft / final."""
-        cap = self.query_one("#caption", Static)
+        cap = self.query_one("#caption", AnimatedCaption)
         if kind == "listening":
-            self._caption = ""
-            cap.set_class(True, "caption-empty")
-            cap.set_class(True, "caption-status")
-            cap.update(
-                Align.center(Text("Listening…", style=f"italic {_SECONDARY}"), vertical="middle")
-            )
+            # Keep settled speech text visible; only show the indicator when empty.
+            if not self._caption:
+                self._caption = ""
+                cap.set_status("Listening…", muted=True)
         elif kind == "transcribing":
             self._caption = ""
-            cap.set_class(True, "caption-empty")
-            cap.set_class(True, "caption-status")
-            cap.update(
-                Align.center(Text("Transcribing…", style=f"italic {_SECONDARY}"), vertical="middle")
-            )
+            cap.set_status("Transcribing…")
         elif kind == "clear":
             self._caption = ""
-            cap.set_class(True, "caption-empty")
-            cap.set_class(True, "caption-status")
-            cap.update(Align.center(Text("", style=f"italic {_MUTED}")))
+            cap.clear_caption()
         else:
             # draft or final speech text
             self._caption = text
-            cap.set_class(False, "caption-empty")
-            cap.set_class(False, "caption-status")
-            style = "#d4d4d4" if kind == "draft" else "bold #e8e8e8"
-            cap.update(Align.center(Text(text, style=style), vertical="middle"))
+            cap.set_speech(text, final=(kind == "final"))
 
     def _start_engine(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        level_bus.reset_level()
         self._set_live_ui(True)
         self._set_status_line("loading", self._opt.title)
         self._set_caption_indicator("listening")
@@ -462,7 +834,7 @@ class ListeningScreen(Screen):
         self._request_stop()
         self._set_live_ui(False)
         self._set_status_line("stopped", "stopping…")
-        self._set_caption_indicator("clear")
+        # Caption keeps the last text so stopping never wipes the record.
 
     def action_toggle_live(self) -> None:
         self._toggle_live()
@@ -470,12 +842,43 @@ class ListeningScreen(Screen):
     def action_export_txt(self) -> None:
         self._export_txt()
 
+    def _flash(self, msg: str, *, color: str = _SECONDARY) -> None:
+        self.query_one("#status", Static).update(Text(msg, style=color))
+
+    def action_settings(self) -> None:
+        self.app.push_screen(SettingsScreen())
+
+    def action_pick_device(self) -> None:
+        self.app.push_screen(DeviceScreen())
+
+    def action_clear_transcript(self) -> None:
+        if not self._lines:
+            self._flash("nothing to clear", color=_MUTED)
+            return
+        cleared = len(self._lines)
+        self._lines.clear()
+        self._words = 0
+        self.query_one("#meter", LevelMeter).set_counts(0, 0)
+        self.query_one("#transcript", RichLog).clear()
+        self._set_caption_indicator("clear")
+        self._flash(f"cleared {cleared} lines", color=_MUTED)
+
+    def action_copy_last(self) -> None:
+        if not self._lines:
+            self._flash("nothing to copy yet", color=_MUTED)
+            return
+        text = self._lines[-1].text
+        if _copy_to_clipboard(text):
+            self._flash(f"copied — {text[:60]}{'…' if len(text) > 60 else ''}")
+        else:
+            self._flash("clipboard not available", color="#e05c5c")
+
     def _toggle_live(self) -> None:
         if self._session_running:
             self._request_stop()
             self._set_live_ui(False)
             self._set_status_line("stopped")
-            self._set_caption_indicator("clear")
+            # Caption keeps the last text so stopping never wipes the record.
             self.query_one("#partial", Static).update("")
         else:
             self._start_engine()
@@ -539,6 +942,8 @@ class ListeningScreen(Screen):
             return
         self.query_one("#partial", Static).update("")
         self._lines.append(TranscriptLine(ts=datetime.now(), text=text))
+        self._words += len(text.split())
+        self.query_one("#meter", LevelMeter).set_counts(len(self._lines), self._words)
         # Settle caption to final text; log gets the timestamped line.
         self._set_caption_indicator("final", text)
         self._set_status_line("listening")  # ready for next utterance after final
@@ -549,15 +954,217 @@ class ListeningScreen(Screen):
     @on(SessionDone)
     def session_done(self, event: SessionDone) -> None:
         self._set_live_ui(False)
-        self._set_caption_indicator("clear")
+        # Caption keeps the last text; nothing is wiped by a stop.
         log = self.query_one("#transcript", RichLog)
         if event.error:
-            self._set_status_line("stopped", f"error — {event.error}")
-            log.write(f"[red]{escape(event.error)}[/]")
+            short = str(event.error).split(". ")[0].rstrip(".")
+            self._set_status_line("stopped", f"error — {short} · full text in log")
+            log.write(f"[red]{escape(str(event.error))}[/]")
+        elif event.summary:
+            self._set_status_line("stopped")
+            log.write(f"[dim]{escape(event.summary)}[/]")
         else:
             self._set_status_line("stopped")
-        if event.summary:
-            log.write(f"[dim]{escape(event.summary)}[/]")
+
+
+class EditValueScreen(ModalScreen[str | None]):
+    """Inline value editor; Enter dismisses with the raw text, Esc with None."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False, priority=True)]
+
+    def __init__(self, title: str, value: str) -> None:
+        super().__init__()
+        self._title = title
+        self._value = value
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="edit-card"):
+            yield Static(self._title, id="edit-title")
+            yield Input(value=self._value, id="edit-input")
+            yield Static("enter save · esc cancel", id="edit-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#edit-input", Input).focus()
+
+    @on(Input.Submitted)
+    def _submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip())
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SettingsScreen(Screen):
+    """Arrow-key settings editor; writes config.json (comments preserved)."""
+
+    BINDINGS = [
+        Binding("escape", "back", "Back", show=False),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._specs: list[SettingSpec] = list(SETTINGS)
+
+    def compose(self) -> ComposeResult:
+        yield TopBar("settings")
+        with Vertical(id="picker-wrap"):
+            yield Static(
+                "Settings  ·  saved to config.json  ·  values apply next session",
+                id="picker-title",
+            )
+            items = [
+                ListItem(Static("", classes="model-title"), id=f"set-{spec.key}")
+                for spec in self._specs
+            ]
+            yield ListView(*items, id="settings-list")
+        yield KeyHint(
+            [("↑↓", "navigate"), ("enter", "edit"), ("esc", "back")],
+            id="keyhint",
+        )
+
+    def on_mount(self) -> None:
+        self._refresh_rows()
+        lv = self.query_one("#settings-list", ListView)
+        lv.focus()
+
+    def _refresh_rows(self) -> None:
+        values = _settings_values()
+        lv = self.query_one("#settings-list", ListView)
+        width = max(len(spec.label) for spec in self._specs)
+        for i, spec in enumerate(self._specs):
+            value = values.get(spec.key, "?")
+            text = f"{spec.label:<{width}}   {spec.fmt.format(value)}"
+            lv.children[i].query_one(".model-title", Static).update(
+                Text(text, style="#e8e8e8")
+            )
+
+    def _flash(self, msg: str, *, color: str = _ACCENT) -> None:
+        self.query_one("#picker-title", Static).update(msg)
+
+    @on(ListView.Selected)
+    def _selected(self, event: ListView.Selected) -> None:
+        item_id = event.item.id or ""
+        key = item_id.removeprefix("set-")
+        spec = next((s for s in self._specs if s.key == key), None)
+        if spec is None:
+            return
+        current = _settings_values().get(spec.key, "")
+        if spec.kind == "choice":
+            hint = f"{spec.label}  ({', '.join(spec.choices)})"
+        else:
+            hint = f"{spec.label}  ({spec.lo}–{spec.hi})"
+        self.app.push_screen(
+            EditValueScreen(hint, spec.fmt.format(current)),
+            callback=lambda raw, s=spec: self._apply(s, raw),
+        )
+
+    def _apply(self, spec: SettingSpec, raw: str | None) -> None:
+        if raw is None or raw == "":
+            return
+        value, error = _parse_setting(spec, raw)
+        if error is not None:
+            self._flash(f"? {error}", color="#e05c5c")
+            return
+        try:
+            save_config({spec.key: value})
+        except Exception as exc:  # noqa: BLE001
+            self._flash(f"save failed — {exc}", color="#e05c5c")
+            return
+        self._refresh_rows()
+        self._flash(f"saved · {spec.key} = {spec.fmt.format(value)}")
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+
+class DeviceScreen(Screen):
+    """Input device picker; the choice is saved to config.json input_device."""
+
+    BINDINGS = [
+        Binding("escape", "back", "Back", show=False),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield TopBar("input device")
+        with Vertical(id="picker-wrap"):
+            yield Static("Select microphone  ·  applies next session", id="picker-title")
+            from engines.mic import list_input_devices
+
+            devices = list_input_devices()
+            current = load_audio_config().input_device
+            items: list[ListItem] = []
+            auto_title = Text("System default (auto)", style="#e8e8e8")
+            if not current:
+                auto_title.append("  · current", style=f"italic {_ACCENT}")
+            items.append(
+                ListItem(
+                    Vertical(
+                        Static(auto_title, classes="model-title"),
+                        Static("Let the app pick (blocklist + prefer order)", classes="model-blurb"),
+                    ),
+                    id="dev-auto",
+                    classes="model-item",
+                )
+            )
+            for dev in devices:
+                title = Text(str(dev["name"]), style="#e8e8e8")
+                if current and str(dev["name"]).casefold() == current.casefold():
+                    title.append("  · current", style=f"italic {_ACCENT}")
+                blurb = f"index {dev['index']} · {dev['max_input_channels']} ch"
+                items.append(
+                    ListItem(
+                        Vertical(
+                            Static(title, classes="model-title"),
+                            Static(blurb, classes="model-blurb"),
+                        ),
+                        id=f"dev-{dev['index']}",
+                        classes="model-item",
+                    )
+                )
+            if not devices:
+                items.append(
+                    ListItem(
+                        Static("No input devices found", classes="model-title"),
+                        id="dev-none",
+                        classes="model-item",
+                    )
+                )
+            yield ListView(*items, id="device-list")
+        yield KeyHint(
+            [("↑↓", "navigate"), ("enter", "select"), ("esc", "back")],
+            id="keyhint",
+        )
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#device-list", ListView)
+        lv.focus()
+
+    @on(ListView.Selected)
+    def _selected(self, event: ListView.Selected) -> None:
+        from engines.mic import list_input_devices
+
+        item_id = event.item.id or ""
+        if item_id == "dev-none":
+            return
+        if item_id == "dev-auto":
+            save_config({"input_device": ""})
+            self.app.pop_screen()
+            return
+        idx = item_id.removeprefix("dev-")
+        try:
+            dev_index = int(idx)
+        except ValueError:
+            return
+        dev = next(
+            (d for d in list_input_devices() if int(d["index"]) == dev_index), None
+        )
+        if dev is None:
+            return
+        save_config({"input_device": str(dev["name"])})
+        self.app.pop_screen()
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
 
 
 class AudioLiveApp(App[None]):
@@ -589,7 +1196,7 @@ class AudioLiveApp(App[None]):
     }
 
     #picker-wrap, #listen-wrap {
-        padding: 1 3;
+        padding: 1 2;
         height: 1fr;
         background: #0a0a0a;
     }
@@ -655,11 +1262,79 @@ class AudioLiveApp(App[None]):
         padding: 0 1;
     }
 
-    /* —— caption stage: generous, calm, no chunky frame —— */
+    /* —— live mic level row —— */
+    #meter {
+        height: 1;
+        padding: 0 1;
+        color: #8a8a8a;
+        background: #0a0a0a;
+    }
+
+    /* —— bottom action bar: clickable, prominent —— */
+    #action-bar {
+        height: 3;
+        dock: bottom;
+        padding: 0 1;
+        background: #0a0a0a;
+    }
+    #action-bar ActionButton {
+        min-width: 10;
+        height: 3;
+        margin: 0 1 0 0;
+        padding: 0 2;
+        background: #161616;
+        color: #c8c8c8;
+        border: round #333333;
+        text-style: bold;
+    }
+    #action-bar ActionButton:hover {
+        background: #1f1f1f;
+        border: round #e8a87c;
+        color: #e8e8e8;
+    }
+    #action-bar #btn-live {
+        color: #e8a87c;
+        border: round #4a3a2e;
+    }
+    #action-bar #btn-clear {
+        color: #e05c5c;
+        border: round #4a2a2a;
+    }
+    #bar-hint {
+        width: 1fr;
+        height: 3;
+        padding: 0 1;
+        content-align: right middle;
+        color: #5a5a5a;
+    }
+
+    /* —— settings / device edit modal —— */
+    #edit-card {
+        width: 64;
+        height: auto;
+        background: #141414;
+        border: round #3a3a3a;
+        padding: 1 2;
+    }
+    #edit-title {
+        color: #e8e8e8;
+        margin-bottom: 1;
+    }
+    #edit-input {
+        background: #0f0f0f;
+        color: #e8e8e8;
+        border: none;
+    }
+    #edit-hint {
+        margin-top: 1;
+        color: #6b6b6b;
+    }
+
+    /* —— caption stage: compact; the transcript gets the reclaimed rows —— */
     #caption-stage {
-        height: 12;
-        margin: 1 0;
-        padding: 2 4;
+        height: 8;
+        margin: 0 0 1 0;
+        padding: 1 2;
         border: none;
         background: #0a0a0a;
         content-align: center middle;

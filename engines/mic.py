@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 import sounddevice as sd
 
+from . import level as level_bus
 from .config import load_audio_config
 
 logger = logging.getLogger("engines.mic")
@@ -53,6 +54,16 @@ def last_input_choice() -> InputChoice | None:
 def pick_input_device() -> int | None:
     """Physical-ish input index, or None when PortAudio should use its default."""
     return select_input_device().index
+
+
+def list_input_devices() -> list[dict]:
+    """Every recordable input as {index, name, max_input_channels} for the picker UI."""
+    try:
+        devices = sd.query_devices()
+    except Exception as exc:
+        logger.warning("Could not query input devices (%s)", exc)
+        return []
+    return _normalize_inputs(list(devices))
 
 
 def listening_label(choice: InputChoice | None = None) -> str:
@@ -126,6 +137,17 @@ def select_input_device(
     if not inputs:
         return InputChoice(index=None, name="default")
 
+    # Explicit config override wins over blocklist and prefer hints.
+    override = (cfg.input_device or "").strip()
+    if override:
+        for dev in inputs:
+            if dev["name"].casefold() == override.casefold():
+                return InputChoice(index=int(dev["index"]), name=str(dev["name"]))
+        logger.warning(
+            "input_device %r not found among inputs; falling back to auto selection",
+            override,
+        )
+
     allowed = [dev for dev in inputs if not _blocked(dev["name"], blocklist)]
     blocked_only = not allowed
     pool = allowed if allowed else inputs
@@ -182,7 +204,16 @@ def open_input_stream(
     def callback(indata, frames, time_info, status):  # noqa: ARG001
         if status:
             pass
-        q.put(indata.copy())
+        block = indata.copy()
+        try:
+            flat = block.reshape(-1)
+            if flat.size:
+                rms = float(np.sqrt(np.mean(np.square(flat, dtype=np.float64))))
+                peak = float(np.max(np.abs(flat)))
+                level_bus.update_level(rms, peak)
+        except Exception:
+            pass
+        q.put(block)
 
     kwargs = dict(
         samplerate=sample_rate,

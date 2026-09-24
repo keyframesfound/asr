@@ -73,6 +73,8 @@ class AudioConfig:
     target_rms: float = DEFAULT_TARGET_RMS
     device_blocklist: tuple[str, ...] = DEFAULT_DEVICE_BLOCKLIST
     device_prefer: tuple[str, ...] = DEFAULT_DEVICE_PREFER
+    # Exact input name from the TUI device picker; empty = auto selection.
+    input_device: str = ""
 
 
 def default_config_path() -> Path:
@@ -172,7 +174,26 @@ def _load_audio(path: Path) -> AudioConfig:
         target_rms=target_rms,
         device_blocklist=blocklist,
         device_prefer=prefer,
+        input_device=_clean_name(data.get("input_device")) if "input_device" in data else "",
     )
+
+
+def save_config(updates: dict[str, Any], *, path: Path | None = None) -> dict[str, Any]:
+    """Merge ``updates`` into config.json and return the reloaded view.
+
+    Comment keys (``// …``) and key order survive the round-trip because they
+    are ordinary JSON keys. Callers validate/clamp before calling; nothing
+    here re-writes values the loaders would silently clamp anyway.
+    """
+    target = (path or CONFIG_PATH).resolve()
+    data = dict(_read_object(target))
+    data.update(updates)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    clear_audio_config_cache()
+    return load_config()
 
 
 def _read_object(path: Path) -> dict:
@@ -214,6 +235,10 @@ def _unit_float(value: object, default: float) -> float:
     if parsed <= 0.0 or parsed > 1.0:
         return default
     return parsed
+
+
+def _clean_name(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
 
 
 def _str_tuple(value: object) -> tuple[str, ...] | None:

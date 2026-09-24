@@ -45,17 +45,33 @@ python main.py
 
 ### Controls
 
+Bottom action bar buttons are clickable; the same actions work from the keyboard.
+
 | Key | Action |
 |-----|--------|
 | ↑ / ↓ | Move in the model list |
 | Enter | Start listening with the selected model |
-| Space | Start / stop live |
+| Space | Start / stop live (transcript and last caption are kept when you stop) |
 | e | Export transcript as `.txt` |
+| s | Settings — edit config.json values in the app |
+| d | Mic picker — choose the input device |
+| x | Clear all (transcript + counts + caption) |
+| c | Copy the last transcript line to the clipboard |
 | m | Reopen the model picker (switch mid-session) |
 | Ctrl+C | Stop the current listening session |
 | q / Esc | Quit (Esc on picker) |
 
-Caption shows **Listening…** / **Transcribing…**, then drafts; finals land in the dim-timestamped log.
+Caption shows **Listening…** / **Transcribing…**, then drafts appear word by word (CJK character by character) with a soft fade-in; finals land in the dim-timestamped log. A slim meter row shows the live mic level, device name, dB, clipping, and transcript counts.
+
+### Settings & mic picker
+
+Press **s** to edit the knobs from `config.json` in-app (written back with the comment keys preserved; values apply to the next session): default engine, Parakeet feed, post-final cooldown, min final chars, speech gate, mic blocksize, echo cooldown, noise floor, AGC target.
+
+Press **d** to pick an input device. The choice is saved as `input_device` in `config.json` and wins over the blocklist/prefer heuristics; choose **System default (auto)** to go back.
+
+### Transcription quality knobs
+
+If finals feel like they are cutting words after a sentence, lower `post_final_cooldown_sec` (audio is discarded that long after each final). If ambient noise produces phantom text, raise `vad_min_rms`. Both are editable live in the settings screen (**s**) and apply next session.
 
 ### Hong Kong CJK font（繁體中文・香港）
 
@@ -96,6 +112,7 @@ Tunable knobs live in `config.json` (keys starting with `//` are comments):
 | `target_rms` | `0.025` | Quiet speech is gained toward this, capped at 4×. |
 | `device_blocklist` | Zoom, Teams, Steam, EShare, BlackHole, Loopback, Soundflower, Aggregate, Multi-output | Case-insensitive. Never chosen when another input exists. |
 | `device_prefer` | AirPods, Headset, Built-in, MacBook, USB | Ordered. First non-blocklisted match wins. |
+| `input_device` | *(empty)* | Exact input name from the mic picker (d). Overrides blocklist/prefer; empty = auto. |
 
 
 ## Secrets
