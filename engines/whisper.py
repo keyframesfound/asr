@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import queue
 import threading
+import time
 from pathlib import Path
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -12,14 +13,31 @@ os.environ["TQDM_DISABLE"] = "1"
 
 import numpy as np
 
-from .audio_util import prepare_chunk
+from .audio_util import chunk_rms, prepare_chunk
+from .config import load_config
 from .base import LiveEngine, OnFinal, OnPartial, SessionSummary
 from .mic import open_input_stream
 
 MODEL_DIR = Path(__file__).resolve().parents[1] / "models" / "whisper-large-v3-turbo"
 CHUNK_SEC = 4.0
-# Filter common silence hallucinations.
-JUNK = {"", "you", "thank you", "thanks for watching", ".", "...", "字幕", "字幕by", "thanks"}
+# Higher than other engines — Whisper hallucinates on room tone / bleed.
+WHISPER_MIN_RMS = 0.02
+# After a committed line, ignore mic audio briefly so speaker/AEC bleed
+# and overlapping hops cannot re-transcribe the same utterance.
+POST_FINAL_COOLDOWN_SEC = 1.5
+JUNK = {
+    "",
+    "you",
+    "thank you",
+    "thanks for watching",
+    ".",
+    "...",
+    "字幕",
+    "字幕by",
+    "thanks",
+    "thank you for watching",
+    "please subscribe",
+}
 
 _PATCHED = False
 _MODEL = None
@@ -70,6 +88,15 @@ def _patch_tqdm_no_mp() -> None:
         tqdm.__init__ = partialmethod(tqdm.__init__, disable=True)
     except Exception:
         pass
+
+
+def unload() -> None:
+    """Drop the warm Whisper model so another engine can own RAM/GPU."""
+    global _MODEL, _PROCESSOR, _DEVICE, _DTYPE
+    _MODEL = None
+    _PROCESSOR = None
+    _DEVICE = None
+    _DTYPE = None
 
 
 def preload() -> str:
@@ -136,10 +163,14 @@ class WhisperTurboEngine(LiveEngine):
             return summary
 
         assert _MODEL is not None and _PROCESSOR is not None
+        cfg = load_config()
+        min_rms = float(cfg.get("vad_min_rms", WHISPER_MIN_RMS))
+        cooldown_sec = float(cfg.get("post_final_cooldown_sec", POST_FINAL_COOLDOWN_SEC))
+
         model, processor, device, dtype = _MODEL, _PROCESSOR, _DEVICE, _DTYPE
 
         def transcribe(audio: np.ndarray) -> str:
-            audio = prepare_chunk(audio)
+            audio = prepare_chunk(audio, min_rms=min_rms)
             if audio is None:
                 return ""
             inputs = processor(audio, sampling_rate=sample_rate, return_tensors="pt")
@@ -147,11 +178,10 @@ class WhisperTurboEngine(LiveEngine):
             with torch.inference_mode():
                 predicted_ids = model.generate(
                     input_features,
-                    # Suppress silence hallucinations
-                    no_speech_threshold=0.6,
-                    compression_ratio_threshold=2.4,
-                    logprob_threshold=-0.8,
+                    language="en",
+                    task="transcribe",
                     condition_on_prev_tokens=False,
+                    use_cache=False,
                 )
             text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
             text = (text or "").strip()
@@ -162,30 +192,63 @@ class WhisperTurboEngine(LiveEngine):
         stop = stop_event or threading.Event()
         need = int(CHUNK_SEC * sample_rate)
         buf = np.zeros(0, dtype=np.float32)
+        cool_until = 0.0
+        last_final = ""
 
-        stream, q = open_input_stream(sample_rate=sample_rate, blocksize=3200)
+        blocksize = int(cfg.get("mic_blocksize", 4096))
+        stream, q = open_input_stream(sample_rate=sample_rate, blocksize=blocksize)
         stream.start()
         on_partial("Listening…")
+        signaled_transcribing = False
         try:
             while not stop.is_set():
                 try:
                     block = q.get(timeout=0.2)
                 except queue.Empty:
                     continue
+                now = time.monotonic()
+                if now < cool_until:
+                    # Drop bleed / self-echo while cooldown is active.
+                    buf = np.zeros(0, dtype=np.float32)
+                    signaled_transcribing = False
+                    continue
                 buf = np.concatenate([buf, block.reshape(-1).astype(np.float32)])
                 while len(buf) >= need and not stop.is_set():
+                    if time.monotonic() < cool_until:
+                        buf = np.zeros(0, dtype=np.float32)
+                        break
                     chunk = buf[:need]
-                    buf = buf[need // 4 :]
+                    # Non-overlapping hops — 75% overlap was re-saying the same line.
+                    buf = buf[need:]
+                    # Peek RMS before heavy work so UI can show Transcribing…
+                    if chunk_rms(chunk) < min_rms:
+                        continue
+                    if not signaled_transcribing:
+                        signaled_transcribing = True
+                        on_partial("Transcribing…")
                     try:
                         text = transcribe(chunk)
                     except Exception as exc:
                         summary.error = str(exc)
                         stop.set()
                         break
-                    if text:
-                        summary.final_count += 1
-                        summary.finals.append(text)
-                        on_final(text)
+                    if not text:
+                        signaled_transcribing = False
+                        on_partial("Listening…")
+                        continue
+                    # Skip near-duplicate of the last commit (echo / re-hear).
+                    if text.lower() == last_final.lower():
+                        cool_until = time.monotonic() + cooldown_sec
+                        buf = np.zeros(0, dtype=np.float32)
+                        continue
+                    last_final = text
+                    summary.final_count += 1
+                    summary.finals.append(text)
+                    on_final(text)
+                    cool_until = time.monotonic() + cooldown_sec
+                    buf = np.zeros(0, dtype=np.float32)
+                    signaled_transcribing = False
+                    on_partial("Listening…")
         except KeyboardInterrupt:
             pass
         finally:
@@ -194,18 +257,4 @@ class WhisperTurboEngine(LiveEngine):
                 stream.close()
             except Exception:
                 pass
-            if len(buf) > sample_rate // 2 and not summary.error:
-                try:
-                    text = transcribe(buf)
-                    if text:
-                        summary.final_count += 1
-                        summary.finals.append(text)
-                        on_final(text)
-                except Exception as exc:
-                    summary.error = str(exc)
         return summary
-
-
-# Back-compat aliases for tui_app imports
-WhisperTurboEngine = WhisperTurboEngine
-_patch_tqdm_no_mp = _patch_tqdm_no_mp

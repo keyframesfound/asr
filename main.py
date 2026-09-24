@@ -2,6 +2,35 @@
 """Audio Live Transcription — interactive terminal UI (default) or legacy CLI."""
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+
+def _configure_hub_offline() -> None:
+    """Stay offline when Parakeet/Whisper caches exist; allow first-run download."""
+    # Parakeet MLX (huggingface_hub layout under models/parakeet-mlx or HF_HOME)
+    parakeet_ready = False
+    try:
+        from engines.parakeet import weights_cached
+
+        parakeet_ready = weights_cached()
+    except Exception:
+        repo = ROOT / "models" / "parakeet-mlx" / "models--mlx-community--parakeet-tdt-0.6b-v3"
+        parakeet_ready = any(repo.glob("snapshots/*/model.safetensors"))
+
+    # Force offline when Parakeet MLX weights are local (avoids hub warnings).
+    # If missing, leave unset so first-run can download into models/parakeet-mlx.
+    # Whisper/SenseVoice use on-disk models/ trees and do not need the hub when present.
+    if parakeet_ready:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+
+_configure_hub_offline()
+
 import argparse
 import sys
 
@@ -51,18 +80,24 @@ def main(argv: list[str] | None = None) -> int:
 
 def _legacy_cli(engine: str | None) -> int:
     """Kept for scripting; prefer the TUI."""
-    from tui_app import ENGINES, _build_engine
+    from tui_app import ENGINES, _build_engine, default_engine_code
 
     code = engine
     if not code:
+        default = default_engine_code()
         print("Audio Live Transcription (legacy CLI)")
         for i, opt in enumerate(ENGINES, 1):
-            print(f"  {i}) {opt.title}")
+            mark = " *" if opt.code == default else ""
+            print(f"  {i}) {opt.title}{mark}")
         print("  q) Quit")
+        print(f"(default: {default} — press Enter)")
         while True:
-            choice = input("Choose engine [1-4]: ").strip().lower()
+            choice = input(f"Choose engine [1-{len(ENGINES)}] or Enter: ").strip().lower()
             if choice in ("q", "quit", "exit"):
                 return 0
+            if choice == "":
+                code = default
+                break
             if choice.isdigit() and 1 <= int(choice) <= len(ENGINES):
                 code = ENGINES[int(choice) - 1].code
                 break

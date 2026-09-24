@@ -4,7 +4,8 @@ from __future__ import annotations
 import numpy as np
 
 # Skip near-silence; boost quiet mics toward TARGET_RMS.
-MIN_RMS = 0.001
+# Whisper overrides min_rms higher to cut ambient / self-echo ghosts.
+MIN_RMS = 0.008
 TARGET_RMS = 0.05
 
 
