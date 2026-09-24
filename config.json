@@ -5,15 +5,33 @@
   "// parakeet_feed_sec": "Audio seconds fed to Parakeet per add_audio (~0.3–0.5). Lower = snappier drafts, more thrash.",
   "parakeet_feed_sec": 0.4,
 
-  "// post_final_cooldown_sec": "Seconds to discard mic audio after each committed final (cuts self-echo / reprint). Shared by live engines.",
+  "// post_final_cooldown_sec": "Seconds the live engines discard mic audio after each committed final (cuts self-echo / reprint). 0 disables. Useful range about 0.8–1.5.",
   "post_final_cooldown_sec": 1.25,
 
   "// mic_blocksize": "sounddevice frames per callback at 16 kHz (~3200–4096 cuts Python wakeups; keep latency reasonable).",
   "mic_blocksize": 4096,
 
-  "// vad_min_rms": "Minimum mic energy (0–1) treated as speech. Higher = less sensitive to ambient / bleed.",
+  "// vad_min_rms": "Minimum mic energy (0–1) the live engines treat as speech. Higher = less sensitive to ambient / bleed.",
   "vad_min_rms": 0.02,
 
   "// min_final_chars": "Prefer not emitting tiny Parakeet finals shorter than this unless the delta ends in punctuation. Latency still wins over perfect segmentation.",
-  "min_final_chars": 8
+  "min_final_chars": 8,
+
+  "// sample_rate": "Engines contract. Fixed at 16000 Hz mono float32; other values are ignored.",
+  "sample_rate": 16000,
+
+  "// cooldown_ms": "Same post-final window for the shared helper in engines/audio_util.py (default 1200, useful range 800–1500; 0 disables). Live engines read post_final_cooldown_sec.",
+  "cooldown_ms": 1200,
+
+  "// min_rms": "prepare_chunk drops audio quieter than this when a caller does not pass its own gate. Kept low for soft speech; vad_min_rms is what the live engines pass.",
+  "min_rms": 0.003,
+
+  "// target_rms": "Quiet speech is gained toward this RMS, capped at 4x so echo is not amplified.",
+  "target_rms": 0.025,
+
+  "// device_blocklist": "Case-insensitive substrings. Loopbacks are never chosen when another input exists.",
+  "device_blocklist": ["Zoom", "Teams", "Steam", "EShare", "BlackHole", "Loopback", "Soundflower", "Aggregate", "Multi-output"],
+
+  "// device_prefer": "Ordered name hints. First match among non-blocklisted inputs wins.",
+  "device_prefer": ["AirPods", "Headset", "Built-in", "MacBook", "USB"]
 }

@@ -77,8 +77,14 @@ Tunable knobs live in `config.json` (keys starting with `//` are comments):
 | `parakeet_feed_sec` | `0.4` | Audio seconds per Parakeet `add_audio` (~0.3–0.5). |
 | `post_final_cooldown_sec` | `1.25` | Discard mic audio after each final (echo/self-print). |
 | `mic_blocksize` | `4096` | sounddevice frames @ 16 kHz (fewer Python wakeups). |
-| `vad_min_rms` | `0.02` | Speech energy gate. |
+| `vad_min_rms` | `0.02` | Speech energy gate passed by the live engines. |
 | `min_final_chars` | `8` | Prefer not emitting tiny Parakeet finals unless punctuated. |
+| `sample_rate` | `16000` | Fixed. 16 kHz mono float32; other values are ignored. |
+| `cooldown_ms` | `1200` | Shared helper window after a final (800–1500; `0` disables). Engines read `post_final_cooldown_sec`. |
+| `min_rms` | `0.003` | `prepare_chunk` floor when a caller does not pass its own gate. |
+| `target_rms` | `0.025` | Quiet speech is gained toward this, capped at 4×. |
+| `device_blocklist` | Zoom, Teams, Steam, EShare, BlackHole, Loopback, Soundflower, Aggregate, Multi-output | Case-insensitive. Never chosen when another input exists. |
+| `device_prefer` | AirPods, Headset, Built-in, MacBook, USB | Ordered. First non-blocklisted match wins. |
 
 
 ## Secrets
