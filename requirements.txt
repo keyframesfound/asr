@@ -1,0 +1,8 @@
+websocket-client>=1.6.0
+sounddevice>=0.4.6
+numpy>=1.24.0
+python-dotenv>=1.0.0
+torch>=2.0.0
+transformers>=4.40.0
+# Optional for SenseVoice:
+# funasr>=1.0.0
