@@ -140,34 +140,67 @@ def _fakes():
                 sys.modules[name] = mod
 
 
+@contextmanager
+def _collapsed_parakeet_ident():
+    """One OS ident for engines.parakeet calls only.
+
+    ``engines.parakeet.threading`` is the real threading module. Replacing
+    ``get_ident`` outright makes ``Thread.join`` resolve the worker as the
+    current thread (``RuntimeError: cannot join current thread``) and races
+    with removal from ``threading._active``. Thread bookkeeping keeps the
+    real ident; Parakeet still sees a reused ident so a ``get_ident()`` key
+    cannot pass this test.
+    """
+    real = threading.get_ident
+
+    def get_ident() -> int:
+        caller = sys._getframe(1).f_globals.get("__name__")
+        if caller == "engines.parakeet":
+            return 1
+        return real()
+
+    with mock.patch("threading.get_ident", get_ident):
+        yield
+
+
 class ParakeetStreamRestartTest(unittest.TestCase):
+    def _finish(self, thread: threading.Thread, done: threading.Event) -> None:
+        self.assertTrue(done.wait(5), "worker did not finish")
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+
     def test_second_worker_gets_a_new_stream_and_reloads(self) -> None:
         with _fakes() as (mx, loads, window):
-            # Same OS ident on every thread. Keying the warm model on get_ident()
-            # would treat the restarted worker as the old one and keep Stream(gpu, 0).
-            with mock.patch("engines.parakeet.threading.get_ident", return_value=1):
+            with _collapsed_parakeet_ident():
                 errors: list[BaseException] = []
 
-                def worker(*, release: bool) -> None:
+                def worker(*, release: bool, done: threading.Event) -> None:
                     try:
                         info = pk.preload()
-                        self.assertNotIn("already loaded", info)
+                        if "already loaded" in info:
+                            raise AssertionError(f"warm model reused across workers: {info}")
                         if release:
                             pk._end_worker_stream()
                     except BaseException as exc:  # noqa: BLE001
                         errors.append(exc)
+                    finally:
+                        done.set()
 
                 # Leave the model warm, as a crashed or not-yet-joined worker would.
-                first = threading.Thread(target=worker, kwargs={"release": False})
+                first_done = threading.Event()
+                first = threading.Thread(
+                    target=worker, kwargs={"release": False, "done": first_done}
+                )
                 first.start()
-                first.join(timeout=5)
-                second = threading.Thread(target=worker, kwargs={"release": True})
+                self._finish(first, first_done)
+                second_done = threading.Event()
+                second = threading.Thread(
+                    target=worker, kwargs={"release": True, "done": second_done}
+                )
                 second.start()
-                second.join(timeout=5)
+                self._finish(second, second_done)
 
             self.assertEqual(errors, [])
-            self.assertFalse(first.is_alive())
-            self.assertFalse(second.is_alive())
             self.assertEqual(len(loads), 2)
             self.assertEqual(mx.streams, ["Stream(gpu, 0)", "Stream(gpu, 1)"])
             self.assertGreaterEqual(mx.cleared, 1)
