@@ -20,7 +20,7 @@ import websocket
 from dotenv import load_dotenv
 
 from .base import LiveEngine, OnFinal, OnPartial, SessionSummary
-from .mic import float32_to_pcm16, open_input_stream
+from .mic import float32_to_pcm16, listening_label, open_input_stream
 
 HOST = "iat-api.xfyun.cn"
 PATH = "/v2/iat"
@@ -173,6 +173,7 @@ class IflytekEngine(LiveEngine):
             def sender():
                 stream, q = open_input_stream(sample_rate=sample_rate)
                 stream.start()
+                on_partial(listening_label())
                 status = STATUS_FIRST
                 try:
                     while not stop.is_set():
