@@ -8,20 +8,31 @@ Claude Code / OpenCode–inspired TUI: slim chrome, keyboard-first. Arrow-key mo
 
 1. **iFlytek live ASR** — cloud streaming 语音听写（流式版）. Credentials in local `.env` (never committed).
 2. **SenseVoice Small** — local FunAudioLLM under `models/sensevoice-small` (needs `funasr`).
-3. **Parakeet Unified EN** — local Parakeet TDT via **parakeet-mlx** (`mlx-community/parakeet-tdt-0.6b-v3`); weights download into `models/parakeet-mlx` on first use (Apple Silicon).
+3. **Parakeet Unified EN** — local Parakeet TDT via **parakeet-mlx** (`mlx-community/parakeet-tdt-0.6b-v3`); weights live in `models/parakeet-mlx` (Apple Silicon).
 4. **Whisper Large V3 Turbo** — local under `models/whisper-large-v3-turbo`.
 
-Model weights are **not** in git. Keep them under this project’s `models/` on your machine.
+Model weights are **not** in git. `scripts/download_models.py` fetches the three local engines into `models/` after pip install. iFlytek stays cloud-only. If Parakeet’s cache is still empty, `./run` can download it on first use; it does not re-download once the weights are present.
 
 ## Setup
+
+Local Whisper, SenseVoice, and Parakeet weights are about **5 GB** and need a network connection. They are not committed. iFlytek has no download.
 
 ```bash
 cd ~/iflytek-live-asr   # or: git clone https://github.com/keyframesfound/asr
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python scripts/download_models.py
 cp .env.example .env    # fill iFlytek keys for cloud ASR
 ```
+
+`scripts/setup.sh` runs that sequence (venv, pip install, download). Re-running the download skips engines whose weights are already on disk. `./run` does not start a multi-GB download when those files are present.
+
+| Model | Folder | Hugging Face repo | Approx. size |
+|-------|--------|-------------------|--------------|
+| Whisper Large V3 Turbo | `models/whisper-large-v3-turbo` | `openai/whisper-large-v3-turbo` | 1.6 GB |
+| SenseVoice Small | `models/sensevoice-small` | `FunAudioLLM/SenseVoiceSmall` | 0.9 GB |
+| Parakeet TDT 0.6B (`parakeet-mlx`) | `models/parakeet-mlx` | `mlx-community/parakeet-tdt-0.6b-v3` | 2.5 GB |
 
 ## Run (interactive TUI)
 

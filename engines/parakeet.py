@@ -14,7 +14,7 @@ from .base import LiveEngine, OnFinal, OnPartial, SessionSummary
 from .config import load_config
 from .mic import open_input_stream
 
-# MLX weights (downloaded on first use into models/parakeet-mlx).
+# MLX weights in models/parakeet-mlx (scripts/download_models.py, or first use).
 MODEL_ID = "mlx-community/parakeet-tdt-0.6b-v3"
 CACHE_DIR = Path(__file__).resolve().parents[1] / "models" / "parakeet-mlx"
 # Legacy Hex CoreML tree (optional; this engine does not use it).

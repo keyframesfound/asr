@@ -39,7 +39,9 @@ def preload() -> str:
     from funasr import AutoModel
 
     if not MODEL_DIR.exists():
-        raise FileNotFoundError(f"Missing model dir: {MODEL_DIR}")
+        raise FileNotFoundError(
+            f"Missing model dir: {MODEL_DIR}. Run: python scripts/download_models.py"
+        )
     _MODEL = AutoModel(model=str(MODEL_DIR), disable_update=True, device="cpu")
     return f"loaded from {MODEL_DIR.name}"
 
@@ -96,7 +98,10 @@ class SenseVoiceEngine(LiveEngine):
     ) -> SessionSummary:
         summary = SessionSummary(engine=self.name)
         if not MODEL_DIR.exists():
-            summary.error = f"Model not found at {MODEL_DIR}."
+            summary.error = (
+                f"Model not found at {MODEL_DIR}. "
+                "Run: python scripts/download_models.py"
+            )
             return summary
 
         try:

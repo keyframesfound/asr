@@ -110,7 +110,9 @@ def preload() -> str:
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
     if not MODEL_DIR.exists():
-        raise FileNotFoundError(f"Missing model dir: {MODEL_DIR}")
+        raise FileNotFoundError(
+            f"Missing model dir: {MODEL_DIR}. Run: python scripts/download_models.py"
+        )
 
     _DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
     _DTYPE = torch.float16 if _DEVICE == "mps" else torch.float32
@@ -144,7 +146,8 @@ class WhisperTurboEngine(LiveEngine):
         summary = SessionSummary(engine=self.name)
         if not MODEL_DIR.exists():
             summary.error = (
-                f"Model not found at {MODEL_DIR}. Download whisper-large-v3-turbo first."
+                f"Model not found at {MODEL_DIR}. "
+                "Run: python scripts/download_models.py"
             )
             return summary
 
