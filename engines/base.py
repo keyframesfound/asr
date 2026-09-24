@@ -23,6 +23,9 @@ class SessionSummary:
     # unsupported, or the session was too short to polish.
     polished: str | None = None
     recorded_sec: float = 0.0
+    # Raw session recording (16 kHz mono float32) for audio export (MP3/WAV).
+    audio: np.ndarray | None = None
+    audio_sample_rate: int = 16000
 
     def short_text(self) -> str:
         lines = [

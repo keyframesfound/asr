@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+
 from rich.align import Align
 from rich.markup import escape
 from rich.text import Text
@@ -123,8 +125,9 @@ def _pick_save_path(default_name: str) -> Path | None:
         if not out:
             return None
         path = Path(out).expanduser()
-        if path.suffix.lower() != ".txt":
-            path = path.with_suffix(".txt")
+        default_suffix = Path(default_name).suffix.lower() or ".txt"
+        if path.suffix.lower() != default_suffix:
+            path = path.with_suffix(default_suffix)
         return path
     except Exception:
         docs = Path.home() / "Documents"
@@ -206,6 +209,42 @@ def _export_body(lines: list[str]) -> str:
     if not lines:
         return ""
     return "\n".join(lines) + "\n"
+
+
+def _wav_bytes(audio: object, sample_rate: int) -> bytes:
+    """16 kHz mono float32 recording → 16-bit PCM WAV file bytes (stdlib only)."""
+    import io
+    import wave
+
+    pcm = (np.clip(np.asarray(audio, dtype=np.float32).reshape(-1), -1.0, 1.0) * 32767.0)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(int(sample_rate))
+        wav.writeframes(pcm.astype("<i2").tobytes())
+    return buf.getvalue()
+
+
+def _encode_mp3(wav_path: Path, out_path: Path) -> bool:
+    """ffmpeg WAV→MP3; False when ffmpeg or libmp3lame is unavailable."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return False
+    try:
+        proc = subprocess.run(
+            [
+                ffmpeg, "-y", "-loglevel", "error",
+                "-i", str(wav_path),
+                "-codec:a", "libmp3lame", "-qscale:a", "4",
+                str(out_path),
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0 and out_path.exists()
 
 
 def _copy_to_clipboard(text: str) -> bool:
@@ -307,12 +346,16 @@ class SessionDone(Message):
         *,
         polished: str | None = None,
         recorded_sec: float = 0.0,
+        audio: object | None = None,
+        sample_rate: int = 16000,
     ) -> None:
         super().__init__()
         self.summary = summary
         self.error = error
         self.polished = polished
         self.recorded_sec = recorded_sec
+        self.audio = audio
+        self.sample_rate = sample_rate
 
 
 class TopBar(Static):
@@ -562,6 +605,43 @@ class AnimatedCaption(Static):
         self.update(Align.center(line, vertical="middle"))
 
 
+class LoadingPanel(Static):
+    """Centered spinner for model load / polish — shown instead of the caption."""
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    TICK_SEC = 0.08
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__("", id=kwargs.pop("id", "loading-panel"), **kwargs)
+        self._frame = 0
+        self._label = "Loading…"
+        self._sub = ""
+
+    def on_mount(self) -> None:
+        self.display = False  # hidden until a layout helper shows it
+        self.set_interval(self.TICK_SEC, self._tick)
+        self._render_panel()
+
+    def set_label(self, label: str, sub: str = "") -> None:
+        self._label = (label or "").strip() or "Loading…"
+        self._sub = (sub or "").strip()
+        self._render_panel()
+
+    def _tick(self) -> None:
+        self._frame = (self._frame + 1) % len(self.FRAMES)
+        self._render_panel()
+
+    def _render_panel(self) -> None:
+        body = Text.assemble(
+            (self.FRAMES[self._frame], f"bold {_ACCENT}"),
+            ("  " + self._label, "#e8e8e8"),
+        )
+        if self._sub:
+            body.append("\n")
+            body.append(Text(self._sub, style=f"italic {_MUTED}"))
+        self.update(Align.center(body, vertical="middle"))
+
+
 class ActionButton(Button):
     """Click-only button — never takes focus, so keys keep working."""
 
@@ -574,9 +654,16 @@ class ModelPickerScreen(Screen):
     """Arrow-key model picker. Defaults to config default_engine (parakeet)."""
 
     BINDINGS = [
-        Binding("escape", "app.quit", "Quit", show=False),
+        Binding("escape", "back", "Back", show=False),
         Binding("q", "app.quit", "Quit", show=False),
     ]
+
+    def __init__(self, can_go_back: bool = False) -> None:
+        super().__init__()
+        # True only when pushed over a listening screen: esc returns there.
+        # On the startup picker esc is inert (q quits) so escape mashing
+        # can never exit the app.
+        self._can_go_back = can_go_back
 
     def compose(self) -> ComposeResult:
         yield TopBar("models")
@@ -585,7 +672,7 @@ class ModelPickerScreen(Screen):
             default = default_engine_code()
             items = []
             for opt in ENGINES:
-                title = Text(opt.title, style="#e8e8e8")
+                title = Text(opt.title)
                 if opt.code == default:
                     title.append("  · default", style=f"italic {_ACCENT}")
                 item = ListItem(
@@ -599,10 +686,11 @@ class ModelPickerScreen(Screen):
                 )
                 items.append(item)
             yield ListView(*items, id="model-list")
-        yield KeyHint(
-            [("↑↓", "navigate"), ("enter", "select"), ("q", "quit")],
-            id="keyhint",
-        )
+        hints = [("↑↓", "navigate"), ("enter", "select")]
+        if self._can_go_back:
+            hints.append(("esc", "back"))
+        hints.append(("q", "quit"))
+        yield KeyHint(hints, id="keyhint")
 
     def on_mount(self) -> None:
         lv = self.query_one("#model-list", ListView)
@@ -612,6 +700,10 @@ class ModelPickerScreen(Screen):
             if opt.code == code:
                 lv.index = i
                 break
+
+    def action_back(self) -> None:
+        if self._can_go_back:
+            self.app.pop_screen()
 
     @on(ListView.Selected)
     def on_selected(self, event: ListView.Selected) -> None:
@@ -633,6 +725,7 @@ class ListeningScreen(Screen):
         Binding("escape", "pick_model", "Models", show=False),
         Binding("space", "toggle_live", "Start/Stop", show=False),
         Binding("e", "export_txt", "Export", show=False),
+        Binding("a", "export_audio", "MP3", show=False),
         Binding("s", "settings", "Settings", show=False),
         Binding("d", "pick_device", "Mic", show=False),
         Binding("x", "clear_transcript", "Clear", show=False),
@@ -654,14 +747,21 @@ class ListeningScreen(Screen):
         self._lines: list[str] = []
         self._caption = ""
         self._words = 0
+        # Raw session recording (for MP3 export), filled at SessionDone.
+        self._audio: object | None = None
+        self._audio_sr = 16000
+        self._cleared = False  # user cleared during/after the last session
         # listening | transcribing | polishing | live | stopped | loading
         self._ui_state = "stopped"
+        # Which main view fills the listen area: loading | live | record
+        self._view = "live"
 
     def compose(self) -> ComposeResult:
         yield TopBar(self._opt.title, show_live=True)
         with Vertical(id="listen-wrap"):
             yield LevelMeter()
             yield Static("", id="status", classes="status-line")
+            yield LoadingPanel(id="loading-panel")
             with Vertical(id="caption-stage"):
                 yield AnimatedCaption(id="caption")
             yield Static("", id="stage-rule", classes="rule")
@@ -678,13 +778,11 @@ class ListeningScreen(Screen):
         with Horizontal(id="action-bar"):
             yield ActionButton("● Live", id="btn-live")
             yield ActionButton("Export", id="btn-export")
+            yield ActionButton("MP3", id="btn-mp3")
             yield ActionButton("Clear all", id="btn-clear")
+            yield ActionButton("Mics", id="btn-mics")
             yield ActionButton("Models", id="btn-models")
             yield ActionButton("Settings", id="btn-settings")
-            yield Static(
-                "space live · e export · s settings · d mic · m models",
-                id="bar-hint",
-            )
 
     def on_mount(self) -> None:
         # Auto-start so selecting a model feels immediate; toggle can stop/restart.
@@ -692,6 +790,39 @@ class ListeningScreen(Screen):
 
     def _top(self) -> TopBar:
         return self.query_one("#top-bar", TopBar)
+
+    # —— main view layouts: loading | live | record ——
+
+    def _set_layout(self, view: str) -> None:
+        """Swap which view fills the listen area; no-op when unchanged."""
+        if self._view == view:
+            return
+        self._view = view
+        try:
+            panel = self.query_one("#loading-panel", LoadingPanel)
+            caption = self.query_one("#caption-stage")
+            rule = self.query_one("#stage-rule")
+            log = self.query_one("#log-scroll")
+        except Exception:
+            return  # not mounted yet
+        panel.display = view == "loading"
+        caption.display = view == "live"
+        rule.display = view == "live"
+        log.display = view in ("live", "record")
+
+    def _show_loading(self, label: str, sub: str = "") -> None:
+        self._set_layout("loading")
+        try:
+            self.query_one("#loading-panel", LoadingPanel).set_label(label, sub)
+        except Exception:
+            pass
+
+    def _show_live_layout(self) -> None:
+        self._set_layout("live")
+
+    def _show_record_layout(self) -> None:
+        """Recording is done: the transcript log takes over the caption area."""
+        self._set_layout("record")
 
     def _set_live_ui(self, running: bool) -> None:
         self._session_running = running
@@ -708,6 +839,14 @@ class ListeningScreen(Screen):
     @on(Button.Pressed, "#btn-export")
     def _btn_export(self) -> None:
         self._export_txt()
+
+    @on(Button.Pressed, "#btn-mp3")
+    def _btn_mp3(self) -> None:
+        self._export_audio()
+
+    @on(Button.Pressed, "#btn-mics")
+    def _btn_mics(self) -> None:
+        self.action_pick_device()
 
     @on(Button.Pressed, "#btn-clear")
     def _btn_clear(self) -> None:
@@ -784,7 +923,13 @@ class ListeningScreen(Screen):
         self._stop.clear()
         level_bus.reset_level()
         self._set_live_ui(True)
+        self._audio = None
+        self._cleared = False
         self._set_status_line("loading", self._opt.title)
+        # Loading screen first; the mic only opens once the model is ready.
+        self._show_loading(
+            f"Loading {self._opt.title}…", sub="mic opens once the model is ready"
+        )
         self._set_caption_indicator("listening")
         self.query_one("#partial", Static).update("")
         app = self.app
@@ -813,6 +958,8 @@ class ListeningScreen(Screen):
                         summary.error,
                         polished=getattr(summary, "polished", None),
                         recorded_sec=float(getattr(summary, "recorded_sec", 0.0) or 0.0),
+                        audio=getattr(summary, "audio", None),
+                        sample_rate=int(getattr(summary, "audio_sample_rate", 16000) or 16000),
                     ),
                 )
             except Exception as exc:  # noqa: BLE001
@@ -832,15 +979,10 @@ class ListeningScreen(Screen):
         self._set_live_ui(False)
         self._set_status_line("stopped", "stopped")
         self._set_caption_indicator("clear")
-        # Drop warm model when leaving so the next pick loads cleanly.
-        try:
-            from engines.warm import drop_all_models
-
-            drop_all_models(keep=None)
-        except Exception:
-            pass
-        self.app.pop_screen()
-        self.app.push_screen(ModelPickerScreen())
+        # Stack the picker on top (like Settings/Mics) so esc returns to this
+        # screen with its transcript. The warm model survives too: the session
+        # worker drops non-matching models when a new engine starts.
+        self.app.push_screen(ModelPickerScreen(can_go_back=True))
 
     def action_stop_session(self) -> None:
         self._request_stop()
@@ -853,6 +995,48 @@ class ListeningScreen(Screen):
 
     def action_export_txt(self) -> None:
         self._export_txt()
+
+    def action_export_audio(self) -> None:
+        self._export_audio()
+
+    def _export_audio(self) -> None:
+        """Save the session recording as MP3 (ffmpeg) — WAV fallback."""
+        audio = self._audio
+        if audio is None or not np.asarray(audio).size:
+            self._flash("no session recording — run live first", color=_MUTED)
+            return
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = _pick_save_path(f"session-{self.engine_code}-{stamp}.mp3")
+        if path is None:
+            self._flash("export cancelled", color=_MUTED)
+            return
+        try:
+            wav = _wav_bytes(audio, self._audio_sr)
+            if path.suffix.lower() == ".wav":
+                path.write_bytes(wav)
+                self._flash(f"exported → {path}")
+                return
+            import tempfile
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            try:
+                tmp.write(wav)
+                tmp.close()
+                if _encode_mp3(Path(tmp.name), path):
+                    self._flash(f"exported → {path}")
+                    return
+            finally:
+                try:
+                    Path(tmp.name).unlink()
+                except Exception:
+                    pass
+            fallback = path.with_suffix(".wav")
+            fallback.write_bytes(wav)
+            self._flash(
+                f"mp3 encoder unavailable — saved {fallback.name}", color=_SECONDARY
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._flash(f"export failed — {exc}", color="#e05c5c")
 
     def _flash(self, msg: str, *, color: str = _SECONDARY) -> None:
         self.query_one("#status", Static).update(Text(msg, style=color))
@@ -870,9 +1054,12 @@ class ListeningScreen(Screen):
         cleared = len(self._lines)
         self._lines.clear()
         self._words = 0
+        self._audio = None
+        self._cleared = True  # a pending polish result should not resurrect text
         self.query_one("#meter", LevelMeter).set_counts(0, 0)
         self.query_one("#transcript", RichLog).clear()
         self._set_caption_indicator("clear")
+        self._show_live_layout()
         self._flash(f"cleared {cleared} lines", color=_MUTED)
 
     def action_copy_last(self) -> None:
@@ -924,28 +1111,35 @@ class ListeningScreen(Screen):
     @on(PartialText)
     def show_partial(self, event: PartialText) -> None:
         kind = _classify_partial(event.text)
-        if kind == "listening":
-            self._set_status_line("listening")
-            # Keep settled final on caption; only show Listening… when empty.
-            if not self._caption:
-                self._set_caption_indicator("listening")
-            self.query_one("#partial", Static).update("")
-        elif kind == "transcribing":
-            self._set_status_line("transcribing")
-            self._set_caption_indicator("transcribing")
-            self.query_one("#partial", Static).update("~ Transcribing…")
-        elif kind == "polishing":
-            self._set_status_line("polishing")
-            self.query_one("#partial", Static).update("")
-            # Caption keeps the last speech — polish replaces it when done.
-        elif kind == "loading":
+        if kind == "loading":
+            if event.text.lower().startswith("ready"):
+                self._show_live_layout()  # model ready → live view
+            else:
+                self._show_loading(event.text)
             self._set_status_line("loading", event.text)
             self.query_one("#partial", Static).update(f"~ {event.text}")
+        elif kind == "polishing":
+            self._show_loading("Polishing session audio…", sub="re-decoding the full recording")
+            self._set_status_line("polishing")
+            self.query_one("#partial", Static).update("")
         else:
-            # Real draft → big centered caption immediately + subtle status.
-            self._set_status_line("live", event.text)
-            self._set_caption_indicator("draft", event.text)
-            self.query_one("#partial", Static).update(f"~ {event.text}")
+            # Anything live (listening / transcribing / draft) shows the live view.
+            self._show_live_layout()
+            if kind == "listening":
+                self._set_status_line("listening")
+                # Keep settled final on caption; only show Listening… when empty.
+                if not self._caption:
+                    self._set_caption_indicator("listening")
+                self.query_one("#partial", Static).update("")
+            elif kind == "transcribing":
+                self._set_status_line("transcribing")
+                self._set_caption_indicator("transcribing")
+                self.query_one("#partial", Static).update("~ Transcribing…")
+            else:
+                # Real draft → big centered caption immediately + subtle status.
+                self._set_status_line("live", event.text)
+                self._set_caption_indicator("draft", event.text)
+                self.query_one("#partial", Static).update(f"~ {event.text}")
 
     @on(FinalText)
     def show_final(self, event: FinalText) -> None:
@@ -964,31 +1158,37 @@ class ListeningScreen(Screen):
     @on(SessionDone)
     def session_done(self, event: SessionDone) -> None:
         self._set_live_ui(False)
+        self._audio = getattr(event, "audio", None)
+        self._audio_sr = int(getattr(event, "sample_rate", 16000) or 16000)
         log = self.query_one("#transcript", RichLog)
         polished = (event.polished or "").strip()
-        if polished and not event.error and self._lines:
-            # Full-session re-decode won: replace the live transcript with it.
+        if polished and not event.error and not self._cleared:
+            # Full-session re-decode won: it becomes the whole transcript —
+            # even when the live loop committed zero finals.
             self._lines = [polished]
             self._words = len(polished.split())
             self.query_one("#meter", LevelMeter).set_counts(1, self._words)
             log.clear()
             log.write(escape(polished))
             self._set_caption_indicator("final", polished)
+            self._show_record_layout()
             secs = f"{event.recorded_sec:.0f}s" if event.recorded_sec else "session"
             self._set_status_line(
                 "stopped", f"polished — full audio re-decoded ({secs})"
             )
             return
-        # Caption keeps the last text; nothing is wiped by a stop.
         if event.error:
+            self._show_live_layout()
             short = str(event.error).split(". ")[0].rstrip(".")
             self._set_status_line("stopped", f"error — {short} · full text in log")
             log.write(f"[red]{escape(str(event.error))}[/]")
-        elif event.summary:
-            self._set_status_line("stopped")
-            log.write(f"[dim]{escape(event.summary)}[/]")
+            return
+        if self._lines:
+            # Recording done: the transcript log takes over the caption area.
+            self._show_record_layout()
         else:
-            self._set_status_line("stopped")
+            self._show_live_layout()
+        self._set_status_line("stopped")
 
 
 class EditValueScreen(ModalScreen[str | None]):
@@ -1059,7 +1259,7 @@ class SettingsScreen(Screen):
             value = values.get(spec.key, "?")
             text = f"{spec.label:<{width}}   {spec.fmt.format(value)}"
             lv.children[i].query_one(".model-title", Static).update(
-                Text(text, style="#e8e8e8")
+                Text(text)
             )
 
     def _flash(self, msg: str, *, color: str = _ACCENT) -> None:
@@ -1117,7 +1317,7 @@ class DeviceScreen(Screen):
             devices = list_input_devices()
             current = load_audio_config().input_device
             items: list[ListItem] = []
-            auto_title = Text("System default (auto)", style="#e8e8e8")
+            auto_title = Text("System default (auto)")
             if not current:
                 auto_title.append("  · current", style=f"italic {_ACCENT}")
             items.append(
@@ -1131,7 +1331,7 @@ class DeviceScreen(Screen):
                 )
             )
             for dev in devices:
-                title = Text(str(dev["name"]), style="#e8e8e8")
+                title = Text(str(dev["name"]))
                 if current and str(dev["name"]).casefold() == current.casefold():
                     title.append("  · current", style=f"italic {_ACCENT}")
                 blurb = f"index {dev['index']} · {dev['max_input_channels']} ch"
@@ -1258,23 +1458,24 @@ class AudioLiveApp(App[None]):
         height: auto;
     }
     .model-title {
-        color: #e8e8e8;
+        color: #8a8a8a;
         text-style: none;
     }
     .model-blurb {
-        color: #6b6b6b;
+        color: #565656;
         text-style: none;
         margin-top: 0;
     }
-    ListItem.--highlight {
+    /* ListItem sets `-highlight` (single dash) on the highlighted row. */
+    ListItem.-highlight {
         background: #1a1a1a;
         border-left: solid #e8a87c;
     }
-    ListItem.--highlight .model-title {
+    ListItem.-highlight .model-title {
         color: #e8e8e8;
         text-style: bold;
     }
-    ListItem.--highlight .model-blurb {
+    ListItem.-highlight .model-blurb {
         color: #8a8a8a;
     }
 
@@ -1284,6 +1485,14 @@ class AudioLiveApp(App[None]):
         color: #6b6b6b;
         margin-bottom: 0;
         padding: 0 1;
+    }
+
+    /* —— loading screen (model load / polish) —— */
+    #loading-panel {
+        height: 1fr;
+        color: #e8e8e8;
+        align: center middle;
+        text-align: center;
     }
 
     /* —— live mic level row —— */
@@ -1323,14 +1532,6 @@ class AudioLiveApp(App[None]):
     #action-bar #btn-clear {
         color: #e05c5c;
         border: round #4a2a2a;
-    }
-    #bar-hint {
-        width: 1fr;
-        min-width: 0;
-        height: 3;
-        padding: 0 1;
-        content-align: left middle;
-        color: #5a5a5a;
     }
 
     /* —— settings / device edit modal —— */
@@ -1433,7 +1634,12 @@ class AudioLiveApp(App[None]):
     def start_listening(self, event: ModelPicked) -> None:
         if isinstance(self.screen, ModelPickerScreen):
             self.pop_screen()
-        self.push_screen(ListeningScreen(event.code))
+        if isinstance(self.screen, ListeningScreen):
+            if self.screen.engine_code == event.code:
+                return  # same model — keep the screen, transcript, warm load
+            self.switch_screen(ListeningScreen(event.code))
+        else:
+            self.push_screen(ListeningScreen(event.code))
 
 
 def run_tui() -> None:

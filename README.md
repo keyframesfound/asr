@@ -53,19 +53,25 @@ Bottom action bar buttons are clickable; the same actions work from the keyboard
 | Enter | Start listening with the selected model |
 | Space | Start / stop live (transcript and last caption are kept when you stop) |
 | e | Export transcript as `.txt` |
+| a | Export the session recording as MP3 (WAV fallback if ffmpeg lacks MP3) |
 | s | Settings — edit config.json values in the app |
-| d | Mic picker — choose the input device |
+| d | Mic picker — choose the input device (the **Mics** button does the same) |
 | x | Clear all (transcript + counts + caption) |
 | c | Copy the last transcript line to the clipboard |
-| m | Reopen the model picker (switch mid-session) |
+| m / Esc | Reopen the model picker (switch mid-session; Esc on the listening view) |
+| Esc | Back — closes the picker / settings / mic screen, returns to listening |
 | Ctrl+C | Stop the current listening session |
-| q / Esc | Quit (Esc on picker) |
+| q | Quit (on any screen) |
+
+Bottom action bar buttons are all clickable: **● Live / ■ Stop**, **Export**, **MP3**, **Clear all**, **Mics**, **Models**, **Settings**. In the model picker, unselected engines are dimmed grey and the highlighted row is bright with an accent bar.
+
+While a model loads, a loading screen takes over and the mic is only opened once the model reports ready. When you stop a session the loading screen returns while the full audio is re-decoded, then the transcript log expands to replace the caption — the finished record becomes the main view.
 
 Caption shows **Listening…** / **Transcribing…**, then drafts appear word by word (CJK character by character) with a soft fade-in; finals land in the transcript log as plain lines. The status line shows the state plus the mic in use (`listening · AirPods Pro`), and the meter row's ● dot + zone-colored bar pulse with the input level so you can see it is listening (○ = no signal), with dB, CLIP, and transcript counts.
 
 ### Full-session polish (stop = re-decode)
 
-While live, the app records every raw mic block. When you stop (**space**), it batch-decodes the whole recording in one pass — full-utterance context, pause-aware boundaries, no early-frozen partials, no discarded windows — and replaces the transcript with the polished text. This is the accuracy model of push-to-talk dictation apps, layered on top of the live captions. Disable with `post_stop_polish: false` (config.json) — on speakers (no headphones) room echo lands in the raw recording and can duplicate lines in the polished output.
+While live, the app records every raw mic block. When you stop (**space**), a loading screen shows the polish pass — it batch-decodes the whole recording in one pass (full-utterance context, pause-aware boundaries, no early-frozen partials, no discarded windows) and replaces the transcript with the polished text. The transcript log then expands to replace the caption, so the finished record is the main view. This is the accuracy model of push-to-talk dictation apps, layered on top of the live captions. The same recording can be saved as MP3 with the **MP3** button (or **a**). Disable polish with `post_stop_polish: false` (config.json) — on speakers (no headphones) room echo lands in the raw recording and can duplicate lines in the polished output.
 
 ### Settings & mic picker
 

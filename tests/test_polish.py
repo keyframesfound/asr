@@ -187,6 +187,27 @@ class ExportBodyTest(unittest.TestCase):
         self.assertNotIn("%H", _export_body(["x"]))
 
 
+class WavBytesTest(unittest.TestCase):
+    def test_header_and_length(self) -> None:
+        from tui_app import _wav_bytes
+
+        sr = 16000
+        audio = np.full(sr, 0.5, dtype=np.float32)  # 1 s
+        data = _wav_bytes(audio, sr)
+        self.assertTrue(data.startswith(b"RIFF"))
+        self.assertIn(b"WAVE", data[:12])
+        self.assertEqual(len(data), 44 + 2 * sr)  # canonical header + 16-bit mono
+
+    def test_clips_and_is_little_endian(self) -> None:
+        from tui_app import _wav_bytes
+
+        audio = np.array([2.0, -2.0, 0.0], dtype=np.float32)
+        data = _wav_bytes(audio, 16000)
+        frames = data[-6:]
+        self.assertEqual(frames[0:2], b"\xff\x7f")  # 2.0 → clipped to 32767 (LE)
+        self.assertEqual(frames[2:4], b"\x01\x80")  # -2.0 → -32767
+
+
 class SummaryShortTextTest(unittest.TestCase):
     def test_polished_preferred_over_preview(self) -> None:
         summary = SessionSummary(engine="Parakeet", finals=["raw draft text"])

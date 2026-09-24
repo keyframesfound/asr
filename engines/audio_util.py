@@ -236,14 +236,19 @@ def polish_session(
     """Best-effort full-session re-decode after a live stop.
 
     ``blocks`` are the raw mic audio recorded before any gating or echo
-    cooldown, so the polish pass sees exactly what a batch dictation app
-    would have seen. Failures are logged and the live transcript stands.
+    cooldown. The concatenated recording lands on ``summary.audio`` even when
+    polish is disabled, so MP3/WAV export still has the session. Failures are
+    logged and the live transcript stands.
     """
-    if not polish_enabled() or summary.error or not blocks:
+    if summary.error or not blocks:
         return
     audio = np.concatenate(
         [np.asarray(b, dtype=np.float32).reshape(-1) for b in blocks]
     )
+    summary.audio = audio
+    summary.audio_sample_rate = sample_rate
+    if not polish_enabled():
+        return
     recorded_sec = audio.size / float(sample_rate)
     if recorded_sec < min_sec:
         return

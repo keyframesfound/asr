@@ -25,6 +25,7 @@ from tui_app import (
     LevelMeter,
     ListeningScreen,
     ModelPickerScreen,
+    ModelPicked,
     TopBar,
 )
 
@@ -133,6 +134,8 @@ class TuiChromeTest(unittest.IsolatedAsyncioTestCase):
             status = screen.query_one("#status")
             bar = screen.query_one("#action-bar")
             btn_live = screen.query_one("#btn-live", ActionButton)
+            btn_mp3 = screen.query_one("#btn-mp3", ActionButton)
+            btn_mics = screen.query_one("#btn-mics", ActionButton)
 
             for widget, label in (
                 (top, "top-bar"),
@@ -141,11 +144,11 @@ class TuiChromeTest(unittest.IsolatedAsyncioTestCase):
                 (status, "status"),
                 (bar, "action-bar"),
                 (btn_live, "btn-live"),
+                (btn_mp3, "btn-mp3"),
+                (btn_mics, "btn-mics"),
             ):
                 self.assertGreater(widget.size.width, 0, label)
                 self.assertGreater(widget.size.height, 0, label)
-            # bar-hint may legitimately collapse to 0 at 80 cols; the
-            # wide-terminal test below asserts its visibility.
 
             self.assertIn("asr", _plain(top))
             self.assertIn("Parakeet Unified EN", _plain(top))
@@ -153,9 +156,10 @@ class TuiChromeTest(unittest.IsolatedAsyncioTestCase):
             # The meter shows the idle dot until audio arrives, plus a dB slot.
             self.assertIn("○", _plain(meter))
             self.assertIn("dB", _plain(meter))
-            # Bottom hints live in the action bar row; status carries the mic.
+            # The clickable bar is the only bottom chrome (no keyhint text).
             self.assertIn("Stop", str(btn_live.label))  # session is live here
-            self.assertIsNotNone(screen.query_one("#bar-hint"))
+            self.assertIn("MP3", str(btn_mp3.label))
+            self.assertIn("Mics", str(btn_mics.label))
 
             # Stopping the session must not clear the message-pump flag.
             self.assertTrue(screen.is_running)
@@ -166,26 +170,169 @@ class TuiChromeTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(callable(screen._context))
             self.assertIn("Live", str(btn_live.label))  # back to start state
 
-    async def test_listening_keyboard_hints_fit_wide_terminal(self) -> None:
-        """At 80 cols the buttons fill the bar; the hint text needs real width."""
+    async def test_loading_and_record_layout_states(self) -> None:
         app = AudioLiveApp()
 
-        def _quiet_start(screen: ListeningScreen) -> None:
-            screen._set_live_ui(True)
-
-        async with app.run_test(size=(140, 30)) as pilot:
+        async with app.run_test(size=(100, 28)) as pilot:
             await pilot.pause()
             screen = ListeningScreen("parakeet")
-            with mock.patch.object(ListeningScreen, "_start_engine", _quiet_start):
+            with mock.patch.object(ListeningScreen, "_start_engine", lambda s: None):
                 await app.push_screen(screen)
             await pilot.pause()
 
-            hint = screen.query_one("#bar-hint")
-            self.assertGreater(hint.size.width, 40, "keyboard hints visible")
-            plain = _plain(hint)
-            self.assertIn("space", plain)
-            self.assertIn("export", plain)
-            self.assertIn("settings", plain)
+            panel = screen.query_one("#loading-panel")
+            caption = screen.query_one("#caption-stage")
+            log = screen.query_one("#log-scroll")
+            # Default: live layout.
+            self.assertFalse(panel.display)
+            self.assertTrue(caption.display)
+            self.assertTrue(log.display)
+
+            screen._show_loading(
+                "Loading Parakeet (MLX GPU)…", "mic opens once the model is ready"
+            )
+            await pilot.pause()
+            self.assertTrue(panel.display)
+            self.assertFalse(caption.display)
+            self.assertFalse(log.display)
+            self.assertIn("Loading Parakeet", _plain(panel))
+            self.assertIn("mic opens once the model is ready", _plain(panel))
+
+            screen._show_live_layout()
+            await pilot.pause()
+            self.assertTrue(caption.display)
+            self.assertTrue(log.display)
+            self.assertFalse(panel.display)
+
+            # Recording done: the transcript log takes over the caption area.
+            screen._show_record_layout()
+            await pilot.pause()
+            self.assertFalse(caption.display)
+            self.assertTrue(log.display)
+            self.assertFalse(panel.display)
+
+    async def test_loading_spinner_animates(self) -> None:
+        app = AudioLiveApp()
+
+        async with app.run_test(size=(100, 28)) as pilot:
+            await pilot.pause()
+            screen = ListeningScreen("parakeet")
+            with mock.patch.object(ListeningScreen, "_start_engine", lambda s: None):
+                await app.push_screen(screen)
+            await pilot.pause()
+            panel = screen.query_one("#loading-panel")
+            screen._show_loading("Loading Whisper Large V3 Turbo…")
+            await pilot.pause()
+            before = _plain(panel)
+            await pilot.pause(0.25)
+            self.assertNotEqual(before, _plain(panel), "spinner frame advances")
+
+    async def test_model_rows_dim_until_highlighted(self) -> None:
+        from textual.color import Color
+
+        app = AudioLiveApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            lv = screen.query_one("#model-list")
+            lv.index = 1
+            await pilot.pause()
+            highlighted = None
+            dimmed = None
+            for item in lv.children:
+                title = item.query_one(".model-title")
+                if "-highlight" in item.classes:
+                    highlighted = title
+                elif dimmed is None:
+                    dimmed = title
+            self.assertIsNotNone(highlighted, "one row carries -highlight")
+            self.assertEqual(dimmed.styles.color, Color(0x8A, 0x8A, 0x8A))
+            self.assertEqual(highlighted.styles.color, Color(0xE8, 0xE8, 0xE8))
+
+    async def _start_on_listening(self, app: AudioLiveApp, pilot, code: str = "parakeet"):
+        """Reach the listening screen through the real startup flow.
+
+        The startup picker is only popped inside start_listening, so pushing
+        a listening screen manually would leave it buried on the stack.
+        """
+        with mock.patch.object(ListeningScreen, "_start_engine", lambda s: None):
+            app.post_message(ModelPicked(code))
+            await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, ListeningScreen)
+        assert len(app.screen_stack) == 2
+        return screen
+
+    async def test_startup_picker_escape_is_inert(self) -> None:
+        """Escape mashing on the startup picker must never quit the app."""
+        app = AudioLiveApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            hint = app.screen.query_one("#keyhint", KeyHint)
+            self.assertIn("quit", _plain(hint))
+            self.assertNotIn("back", _plain(hint))
+
+            await pilot.press("escape", "escape", "escape")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ModelPickerScreen)
+            self.assertTrue(app.is_running)
+
+    async def test_escape_from_listening_round_trips_picker(self) -> None:
+        """esc: listening → picker → listening; mashing never quits or leaks."""
+        app = AudioLiveApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            screen = await self._start_on_listening(app, pilot)
+
+            await pilot.press("escape")
+            await pilot.pause()
+            picker = app.screen
+            self.assertIsInstance(picker, ModelPickerScreen)
+            self.assertTrue(picker._can_go_back)
+            self.assertIn("back", _plain(picker.query_one("#keyhint", KeyHint)))
+
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertIs(app.screen, screen)
+
+            # Mash: picker and listening alternate, the app stays alive,
+            # and no stale listening screens pile up in the stack.
+            await pilot.press("escape", "escape", "escape", "escape", "escape", "escape")
+            await pilot.pause()
+            self.assertIs(app.screen, screen)
+            self.assertEqual(len(app.screen_stack), 2)
+            self.assertTrue(app.is_running)
+
+    async def test_same_model_pick_keeps_listening_screen(self) -> None:
+        app = AudioLiveApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            screen = await self._start_on_listening(app, pilot, "parakeet")
+            await pilot.press("escape")
+            await pilot.pause()
+
+            app.post_message(ModelPicked("parakeet"))
+            await pilot.pause()
+            self.assertIs(app.screen, screen)
+            self.assertEqual(len(app.screen_stack), 2)
+            self.assertTrue(app.is_running)
+
+    async def test_other_model_pick_replaces_listening_screen(self) -> None:
+        app = AudioLiveApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await self._start_on_listening(app, pilot, "parakeet")
+            await pilot.press("escape")
+            await pilot.pause()
+
+            with mock.patch.object(ListeningScreen, "_start_engine", lambda s: None):
+                app.post_message(ModelPicked("sensevoice"))
+                await pilot.pause()
+            self.assertIsInstance(app.screen, ListeningScreen)
+            self.assertEqual(app.screen.engine_code, "sensevoice")
+            # Replaced, not stacked: no abandoned listening screen underneath.
+            self.assertEqual(len(app.screen_stack), 2)
+            self.assertTrue(app.is_running)
 
 
 if __name__ == "__main__":
