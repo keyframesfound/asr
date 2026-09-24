@@ -177,7 +177,7 @@ class TranscriptLine:
 class TopBar(Static):
     """Slim custom chrome: asr · context · clock.
 
-    The label lives on ``_context_label``. ``MessagePump._context`` is the
+    The label lives on ``_bar_context``. ``MessagePump._context`` is the
     context manager wrapped around the message loop (``with self._context():``).
     Storing a string under that name makes the pump raise
     ``TypeError: 'str' object is not callable`` and the screen never paints.
@@ -185,7 +185,7 @@ class TopBar(Static):
 
     def __init__(self, context: str = "", *, show_live: bool = False) -> None:
         super().__init__(id="top-bar")
-        self._context_label = context
+        self._bar_context = context
         self._show_live = show_live
         self._live = False
 
@@ -197,7 +197,7 @@ class TopBar(Static):
         self._render_bar()
 
     def set_context(self, context: str) -> None:
-        self._context_label = context
+        self._bar_context = context
         self._render_bar()
 
     def set_live(self, live: bool) -> None:
@@ -206,9 +206,9 @@ class TopBar(Static):
 
     def _render_bar(self) -> None:
         parts: list[Text] = [Text("asr", style=f"bold {_ACCENT}")]
-        if self._context_label:
+        if self._bar_context:
             parts.append(Text("  ·  ", style=_MUTED))
-            parts.append(Text(self._context_label, style="#e8e8e8"))
+            parts.append(Text(self._bar_context, style="#e8e8e8"))
         if self._show_live:
             parts.append(Text("  ·  ", style=_MUTED))
             if self._live:
@@ -253,6 +253,7 @@ class ModelPickerScreen(Screen):
                     Vertical(
                         Static(opt.title, classes="model-title"),
                         Static(opt.blurb, classes="model-blurb"),
+                        classes="model-copy",
                     ),
                     id=f"eng-{opt.code}",
                     classes="model-item",
@@ -600,7 +601,11 @@ class AudioLiveApp(App[None]):
         padding: 0 1;
     }
 
-    /* —— model list —— */
+    /* —— model list ——
+       Vertical defaults to height: 1fr. Inside a ListItem that fills the
+       viewport, so each engine row becomes one screen tall and the other
+       models sit below the fold behind the scrollbar. Keep the copy at
+       content height so all four engines are on screen. */
     #model-list {
         height: 1fr;
         background: #0a0a0a;
@@ -608,10 +613,18 @@ class AudioLiveApp(App[None]):
         padding: 0;
     }
     ListView > .model-item {
-        padding: 1 2;
+        height: auto;
+        padding: 0 1;
         margin: 0 0 1 0;
         background: #0a0a0a;
         border-left: solid #0a0a0a;
+    }
+    .model-copy {
+        height: auto;
+        width: 1fr;
+    }
+    .model-title, .model-blurb {
+        height: auto;
     }
     .model-title {
         color: #e8e8e8;

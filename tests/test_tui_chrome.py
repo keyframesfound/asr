@@ -30,6 +30,18 @@ def _plain(widget: Widget) -> str:
     return str(content)
 
 
+def _visible_model_titles(screen) -> list[str]:
+    """Titles whose row intersects the list viewport (not scrolled off-screen)."""
+    models = screen.query_one("#model-list")
+    top = models.region.y
+    bottom = models.region.y + models.region.height
+    found: list[str] = []
+    for item in models.children:
+        if item.region.y < bottom and item.region.y + item.region.height > top:
+            found.append(_plain(item.query_one(".model-title")))
+    return found
+
+
 def _shadowed_methods(node: DOMNode) -> list[str]:
     """Instance attributes that hide a callable defined on the class."""
     found: list[str] = []
@@ -68,17 +80,19 @@ class TuiChromeTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertIn("asr", _plain(top))
             self.assertIn("models", _plain(top))
-            self.assertEqual(top._context_label, "models")
+            self.assertEqual(top._bar_context, "models")
             self.assertTrue(callable(top._context))
             self.assertEqual(len(models.children), len(ENGINES))
-            titles = [_plain(w) for w in screen.query(".model-title")]
-            self.assertIn("Parakeet Unified EN", titles)
+            self.assertEqual(_visible_model_titles(screen), [opt.title for opt in ENGINES])
+            for item in models.children:
+                self.assertLess(item.size.height, models.size.height)
+                self.assertLessEqual(item.size.height, 6)
             self.assertIn("enter", _plain(hint))
             self.assertIn("quit", _plain(hint))
 
             top.set_context("renamed")
             await pilot.pause()
-            self.assertEqual(top._context_label, "renamed")
+            self.assertEqual(top._bar_context, "renamed")
             self.assertIn("renamed", _plain(top))
             self.assertTrue(top.is_running)
             self.assertTrue(callable(top._context))

@@ -28,8 +28,11 @@ MIN_FINAL_CHARS = 8
 _PUNCT_END = tuple(".?!。？！…,;:，、")
 
 _MODEL = None
-_MODEL_THREAD: int | None = None
+_MODEL_THREAD: int | None = None  # id(threading.current_thread()), not get_ident()
 _MODEL_STREAM = None  # mx.Stream used for load + inference on this thread
+# One live Parakeet worker at a time. A restart must not touch MLX until the
+# previous thread has dropped its stream.
+_WORKER_LOCK = threading.Lock()
 
 
 def weights_cached() -> bool:
@@ -48,21 +51,114 @@ def weights_cached() -> bool:
     return False
 
 
+def _thread_key() -> int:
+    """Identity of this worker. ``get_ident()`` can be reused after a thread exits."""
+    return id(threading.current_thread())
+
+
+def _drop_parakeet_array_caches() -> None:
+    """Forget mx.arrays parakeet_mlx cached on a previous worker.
+
+    ``parakeet_mlx.audio`` memoizes window functions (``hanning`` and friends)
+    with ``lru_cache``. Those arrays are permanently bound to the stream that
+    created them — typically ``Stream(gpu, 0)`` on the first live thread.
+    The next worker then dies with
+    ``There is no Stream(gpu, 0) in current thread``.
+    """
+    import sys
+
+    modules = [
+        mod
+        for name, mod in list(sys.modules.items())
+        if name == "parakeet_mlx" or name.startswith("parakeet_mlx.")
+    ]
+    for mod in modules:
+        for value in vars(mod).values():
+            clear = getattr(value, "cache_clear", None)
+            if not callable(clear):
+                continue
+            try:
+                clear()
+            except Exception:
+                pass
+
+
 def unload() -> None:
-    """Drop the warm Parakeet model so another engine can own GPU/RAM."""
+    """Drop the warm Parakeet model so another engine or thread can own the GPU."""
     global _MODEL, _MODEL_THREAD, _MODEL_STREAM
     _MODEL = None
     _MODEL_THREAD = None
     _MODEL_STREAM = None
+    _drop_parakeet_array_caches()
+
+
+def _clear_mlx_streams(mx) -> None:
+    """Destroy streams created on this thread (``mx.clear_streams`` when present)."""
+    sync = getattr(mx, "synchronize", None)
+    if callable(sync):
+        try:
+            sync()
+        except Exception:
+            pass
+    clear = getattr(mx, "clear_streams", None)
+    if callable(clear):
+        try:
+            clear()
+        except Exception:
+            pass
+
+
+def _end_worker_stream() -> None:
+    """Release this worker's model and GPU stream before the thread exits.
+
+    The next live session runs on a new thread and must create its own stream.
+    Leaving ``Stream(gpu, 0)`` (and arrays that point at it) behind makes
+    restart raise ``There is no Stream(gpu, 0) in current thread``.
+    """
+    mx = None
+    try:
+        import mlx.core as mx
+    except Exception:
+        mx = None
+    stream = _MODEL_STREAM
+    if mx is not None and stream is not None:
+        try:
+            mx.synchronize(stream)
+        except Exception:
+            pass
+    unload()
+    if mx is not None:
+        _clear_mlx_streams(mx)
+
+
+def _realize_on_stream(mx, model) -> None:
+    """Evaluate parameters on the stream that just loaded them."""
+    try:
+        params = model.parameters()
+    except Exception:
+        return
+    leaves = None
+    try:
+        from mlx.utils import tree_flatten
+
+        leaves = [leaf for _name, leaf in tree_flatten(params)]
+    except Exception:
+        leaves = None
+    if not leaves:
+        return
+    try:
+        mx.eval(*leaves)
+    except Exception:
+        pass
 
 
 def _bind_mlx_gpu_on_this_thread():
-    """Bind MLX to GPU on this thread; refuse Stream(cpu, …) for live inference.
+    """Create a new GPU stream on this thread; refuse Stream(cpu, …).
 
-    MLX default streams are thread-local. Textual runs engines on a worker
-    thread; restarting live creates a new thread. Arrays loaded on another
-    thread still reference Stream(cpu, N) from that thread and raise:
-    There is no Stream(cpu, N) in current thread.
+    MLX streams are thread-local. Textual starts a new worker each time live
+    ASR is toggled. ``mx.new_stream`` here must run on that worker — a stream
+    object left over from the previous thread is ``Stream(gpu, N)`` with no
+    command encoder on the new thread.
     """
     import mlx.core as mx
 
@@ -98,6 +194,12 @@ def _bind_mlx_gpu_on_this_thread():
         )
 
     stream = mx.new_stream(device)
+    set_default = getattr(mx, "set_default_stream", None)
+    if callable(set_default):
+        try:
+            set_default(stream)
+        except Exception:
+            pass
     stream_str = str(stream).lower()
     if "cpu" in stream_str and "gpu" not in stream_str:
         raise RuntimeError(
@@ -115,20 +217,24 @@ def _bind_mlx_on_this_thread():
 def preload() -> str:
     """Load model on the calling thread; store GPU stream for later inference."""
     global _MODEL, _MODEL_THREAD, _MODEL_STREAM
-    tid = threading.get_ident()
-    if _MODEL is not None and _MODEL_THREAD == tid and _MODEL_STREAM is not None:
+    key = _thread_key()
+    if _MODEL is not None and _MODEL_THREAD == key and _MODEL_STREAM is not None:
         return f"already loaded ({MODEL_ID})"
-    # Model (and its streams) from another thread cannot be reused.
-    if _MODEL is not None and _MODEL_THREAD != tid:
-        unload()
-
-    from parakeet_mlx import from_pretrained
+    # Model, window caches, and streams from another thread cannot be reused.
+    unload()
 
     mx, stream, device = _bind_mlx_gpu_on_this_thread()
+    # Import / cached mx.arrays must be rebuilt on this thread's stream.
+    _drop_parakeet_array_caches()
+    from parakeet_mlx import from_pretrained
+
+    _drop_parakeet_array_caches()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     with mx.stream(stream):
-        _MODEL = from_pretrained(MODEL_ID, cache_dir=CACHE_DIR)
-    _MODEL_THREAD = tid
+        model = from_pretrained(MODEL_ID, cache_dir=CACHE_DIR)
+        _realize_on_stream(mx, model)
+    _MODEL = model
+    _MODEL_THREAD = key
     _MODEL_STREAM = stream
     return f"loaded {MODEL_ID} on {device}"
 
@@ -155,6 +261,31 @@ class ParakeetEngine(LiveEngine):
     name = "Parakeet Unified EN"
 
     def run(
+        self,
+        on_partial: OnPartial,
+        on_final: OnFinal,
+        *,
+        sample_rate: int = 16000,
+        stop_event: threading.Event | None = None,
+    ) -> SessionSummary:
+        """Run one live session, then drop this thread's MLX stream.
+
+        Stop/restart starts a new worker. The lock waits until the previous
+        worker has called ``clear_streams`` so the new thread can bind a
+        fresh GPU stream instead of touching ``Stream(gpu, 0)``.
+        """
+        with _WORKER_LOCK:
+            try:
+                return self._run_locked(
+                    on_partial,
+                    on_final,
+                    sample_rate=sample_rate,
+                    stop_event=stop_event,
+                )
+            finally:
+                _end_worker_stream()
+
+    def _run_locked(
         self,
         on_partial: OnPartial,
         on_final: OnFinal,
