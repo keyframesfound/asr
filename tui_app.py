@@ -12,6 +12,13 @@ from textual.message import Message
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Label, ListItem, ListView, RichLog, Static
 
+# Patch tqdm before any engine load — Textual's FDs break multiprocessing locks.
+try:
+    from engines.whisper import _patch_tqdm_no_mp
+    _patch_tqdm_no_mp()
+except Exception:
+    pass
+
 
 @dataclass(frozen=True)
 class EngineOption:

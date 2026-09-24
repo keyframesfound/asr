@@ -40,6 +40,11 @@ def main(argv: list[str] | None = None) -> int:
 
     from tui_app import run_tui
 
+    try:
+        from engines.whisper import _patch_tqdm_no_mp
+        _patch_tqdm_no_mp()
+    except Exception:
+        pass
     run_tui()
     return 0
 
