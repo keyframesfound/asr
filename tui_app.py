@@ -175,11 +175,17 @@ class TranscriptLine:
 
 
 class TopBar(Static):
-    """Slim custom chrome: asr · context · clock."""
+    """Slim custom chrome: asr · context · clock.
+
+    The label lives on ``_context_label``. ``MessagePump._context`` is the
+    context manager wrapped around the message loop (``with self._context():``).
+    Storing a string under that name makes the pump raise
+    ``TypeError: 'str' object is not callable`` and the screen never paints.
+    """
 
     def __init__(self, context: str = "", *, show_live: bool = False) -> None:
         super().__init__(id="top-bar")
-        self._context = context
+        self._context_label = context
         self._show_live = show_live
         self._live = False
 
@@ -191,7 +197,7 @@ class TopBar(Static):
         self._render_bar()
 
     def set_context(self, context: str) -> None:
-        self._context = context
+        self._context_label = context
         self._render_bar()
 
     def set_live(self, live: bool) -> None:
@@ -200,9 +206,9 @@ class TopBar(Static):
 
     def _render_bar(self) -> None:
         parts: list[Text] = [Text("asr", style=f"bold {_ACCENT}")]
-        if self._context:
+        if self._context_label:
             parts.append(Text("  ·  ", style=_MUTED))
-            parts.append(Text(self._context, style="#e8e8e8"))
+            parts.append(Text(self._context_label, style="#e8e8e8"))
         if self._show_live:
             parts.append(Text("  ·  ", style=_MUTED))
             if self._live:
@@ -296,7 +302,10 @@ class ListeningScreen(Screen):
         self.engine_code = engine_code
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._running = False
+        # MessagePump._running is the message-loop flag (is_running / idle).
+        # A session flag under that name stops the pump from seeing idle work
+        # as soon as live ASR is toggled off.
+        self._session_running = False
         self._opt = next(o for o in ENGINES if o.code == engine_code)
         self._lines: list[TranscriptLine] = []
         self._caption = ""
@@ -333,7 +342,7 @@ class ListeningScreen(Screen):
         return self.query_one("#top-bar", TopBar)
 
     def _set_live_ui(self, running: bool) -> None:
-        self._running = running
+        self._session_running = running
         self._top().set_live(running)
 
     def _set_status_line(self, state: str, detail: str = "") -> None:
@@ -461,7 +470,7 @@ class ListeningScreen(Screen):
         self._export_txt()
 
     def _toggle_live(self) -> None:
-        if self._running:
+        if self._session_running:
             self._request_stop()
             self._set_live_ui(False)
             self._set_status_line("stopped")
