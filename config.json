@@ -1,0 +1,19 @@
+{
+  "// default_engine": "Model picker / CLI default when none specified. Prefer parakeet for English live; use sensevoice for Cantonese.",
+  "default_engine": "parakeet",
+
+  "// parakeet_feed_sec": "Audio seconds fed to Parakeet per add_audio (~0.3–0.5). Lower = snappier drafts, more thrash.",
+  "parakeet_feed_sec": 0.4,
+
+  "// post_final_cooldown_sec": "Seconds to discard mic audio after each committed final (cuts self-echo / reprint). Shared by live engines.",
+  "post_final_cooldown_sec": 1.25,
+
+  "// mic_blocksize": "sounddevice frames per callback at 16 kHz (~3200–4096 cuts Python wakeups; keep latency reasonable).",
+  "mic_blocksize": 4096,
+
+  "// vad_min_rms": "Minimum mic energy (0–1) treated as speech. Higher = less sensitive to ambient / bleed.",
+  "vad_min_rms": 0.02,
+
+  "// min_final_chars": "Prefer not emitting tiny Parakeet finals shorter than this unless the delta ends in punctuation. Latency still wins over perfect segmentation.",
+  "min_final_chars": 8
+}

@@ -2,6 +2,16 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
+
+# Stay offline when Parakeet MLX weights are already cached; otherwise allow
+# huggingface_hub to download on first use.
+PARAKEET_SNAP="$ROOT/models/parakeet-mlx/models--mlx-community--parakeet-tdt-0.6b-v3"
+if compgen -G "$PARAKEET_SNAP/snapshots/*/model.safetensors" > /dev/null; then
+  export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+  export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+fi
+export HF_HUB_DISABLE_TELEMETRY="${HF_HUB_DISABLE_TELEMETRY:-1}"
+
 if [[ -x "$ROOT/.venv/bin/python" ]]; then
   exec "$ROOT/.venv/bin/python" "$ROOT/main.py" "$@"
 fi
