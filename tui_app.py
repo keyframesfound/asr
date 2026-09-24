@@ -124,7 +124,12 @@ class ModelPickerScreen(Screen):
 
 
 class ListeningScreen(Screen):
-    """Live transcription view."""
+    """Live transcription view.
+
+    The caption (#partial) and transcript log (#transcript) use the
+    terminal typeface. Textual CSS cannot set PingFang HK; see the
+    stylesheet comment and README section "Hong Kong CJK font".
+    """
 
     BINDINGS = [
         Binding("m", "pick_model", "Models", show=True),
@@ -272,15 +277,24 @@ class AudioLiveApp(App[None]):
         border: tall #333333;
         background: #141414;
     }
+    /* Caption (#partial) and transcript log (#transcript).
+       Textual CSS has no font-family or font-size. Declaring
+       font-family is an error ("Invalid CSS property 'font-family'")
+       and the TUI will not start. These widgets inherit Terminal.app's
+       font. Preferred stack for 繁體中文（香港）, in order:
+       PingFang HK（蘋方-港）, Noto Sans HK, Noto Sans TC.
+       Set that face in Terminal.app — README, "Hong Kong CJK font". */
     #transcript {
         height: auto;
         min-height: 100%;
         background: #141414;
+        text-wrap: wrap;
     }
     #partial {
         height: 3;
         color: #909090;
         margin-top: 1;
+        text-wrap: wrap;
     }
     Header {
         background: #1a1a1a;
