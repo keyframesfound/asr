@@ -6,9 +6,11 @@ import queue
 import threading
 from pathlib import Path
 
-# Avoid tokenizer/fork side channels that break under Textual + PortAudio on macOS.
+# Textual holds irregular FDs; tqdm→multiprocessing.RLock→spawnv_passfds then
+# raises ValueError: bad value(s) in fds_to_keep. Keep all of this in-process.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TQDM_DISABLE", "1")
 
 import numpy as np
 
@@ -17,6 +19,22 @@ from .mic import open_input_stream
 
 MODEL_DIR = Path(__file__).resolve().parents[1] / "models" / "whisper-large-v3-turbo"
 CHUNK_SEC = 4.0
+
+
+def _disable_hf_progress() -> None:
+    try:
+        from transformers.utils.logging import disable_progress_bar
+
+        disable_progress_bar()
+    except Exception:
+        pass
+    try:
+        from tqdm import tqdm
+        from functools import partialmethod
+
+        tqdm.__init__ = partialmethod(tqdm.__init__, disable=True)  # type: ignore[method-assign]
+    except Exception:
+        pass
 
 
 class WhisperTurboEngine(LiveEngine):
@@ -44,23 +62,15 @@ class WhisperTurboEngine(LiveEngine):
             summary.error = f"Missing dependency: {exc}. pip install torch transformers"
             return summary
 
-        # Force spawn so nothing tries to fork while PortAudio holds FDs.
-        try:
-            import multiprocessing as mp
-
-            if mp.get_start_method(allow_none=True) != "spawn":
-                mp.set_start_method("spawn", force=True)
-        except RuntimeError:
-            pass
+        _disable_hf_progress()
 
         device = "mps" if torch.backends.mps.is_available() else "cpu"
         dtype = torch.float16 if device == "mps" else torch.float32
         on_partial(f"Loading {self.name} on {device}…")
 
-        # Load BEFORE opening the mic so HF/torch setup never races PortAudio FDs.
         model = AutoModelForSpeechSeq2Seq.from_pretrained(
             str(MODEL_DIR),
-            torch_dtype=dtype,
+            dtype=dtype,
             low_cpu_mem_usage=True,
         )
         model.to(device)
@@ -68,19 +78,10 @@ class WhisperTurboEngine(LiveEngine):
         processor = AutoProcessor.from_pretrained(str(MODEL_DIR))
 
         def transcribe(audio: np.ndarray) -> str:
-            # Direct generate path — no transformers pipeline (avoids worker pools).
-            inputs = processor(
-                audio,
-                sampling_rate=sample_rate,
-                return_tensors="pt",
-            )
+            inputs = processor(audio, sampling_rate=sample_rate, return_tensors="pt")
             input_features = inputs.input_features.to(device=device, dtype=dtype)
             with torch.inference_mode():
-                predicted_ids = model.generate(
-                    input_features,
-                    task="transcribe",
-                    language=None,
-                )
+                predicted_ids = model.generate(input_features)
             text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
             return (text or "").strip()
 
@@ -100,7 +101,7 @@ class WhisperTurboEngine(LiveEngine):
                 buf = np.concatenate([buf, block.reshape(-1).astype(np.float32)])
                 while len(buf) >= need and not stop.is_set():
                     chunk = buf[:need]
-                    buf = buf[need // 4 :]  # ~75% overlap hop
+                    buf = buf[need // 4 :]
                     try:
                         text = transcribe(chunk)
                     except Exception as exc:  # noqa: BLE001
