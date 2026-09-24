@@ -1,6 +1,7 @@
 """Parakeet Unified EN (CoreML / Hex FluidAudio) — structural runner."""
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from .base import LiveEngine, OnFinal, OnPartial, SessionSummary
@@ -21,8 +22,9 @@ class ParakeetEngine(LiveEngine):
         on_final: OnFinal,
         *,
         sample_rate: int = 16000,
+        stop_event: threading.Event | None = None,
     ) -> SessionSummary:
-        del on_partial, on_final, sample_rate
+        del on_partial, on_final, sample_rate, stop_event
         summary = SessionSummary(engine=self.name)
         if not MODEL_DIR.exists():
             summary.error = f"Model not found at {MODEL_DIR}."

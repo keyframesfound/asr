@@ -95,6 +95,7 @@ class IflytekEngine(LiveEngine):
         on_final: OnFinal,
         *,
         sample_rate: int = 16000,
+        stop_event: threading.Event | None = None,
     ) -> SessionSummary:
         _load_env()
         app_id = os.getenv("XFYUN_APP_ID") or os.getenv("APPID") or ""
@@ -111,7 +112,7 @@ class IflytekEngine(LiveEngine):
             )
             return summary
 
-        stop = threading.Event()
+        stop = stop_event or threading.Event()
         result_lock = threading.Lock()
         last_partial = ""
 

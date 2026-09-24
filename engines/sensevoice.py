@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,7 @@ class SenseVoiceEngine(LiveEngine):
         on_final: OnFinal,
         *,
         sample_rate: int = 16000,
+        stop_event: threading.Event | None = None,
     ) -> SessionSummary:
         summary = SessionSummary(engine=self.name)
         if not MODEL_DIR.exists():
@@ -41,7 +43,7 @@ class SenseVoiceEngine(LiveEngine):
         on_partial("Loading SenseVoice…")
         model = AutoModel(model=str(MODEL_DIR), disable_update=True, device="cpu")
 
-        stop = threading.Event()
+        stop = stop_event or threading.Event()
         need = int(CHUNK_SEC * sample_rate)
         buf = np.zeros(0, dtype=np.float32)
         stream, q = open_input_stream(sample_rate=sample_rate)

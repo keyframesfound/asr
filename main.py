@@ -1,112 +1,85 @@
 #!/usr/bin/env python3
-"""Audio Live Transcription — terminal CLI for iFlytek + local ASR engines."""
+"""Audio Live Transcription — interactive terminal UI (default) or legacy CLI."""
 from __future__ import annotations
 
 import argparse
 import sys
 
 
-ENGINES = {
-    "1": ("iflytek", "iFlytek live ASR (cloud)"),
-    "2": ("sensevoice", "SenseVoice Small (local)"),
-    "3": ("parakeet", "Parakeet Unified EN / CoreML (local)"),
-    "4": ("whisper", "Whisper Large V3 Turbo (local)"),
-}
-
-ALIASES = {
-    "iflytek": "iflytek",
-    "iat": "iflytek",
-    "sensevoice": "sensevoice",
-    "sense": "sensevoice",
-    "parakeet": "parakeet",
-    "pikaret": "parakeet",
-    "whisper": "whisper",
-    "turbo": "whisper",
-}
-
-
-def _print_menu() -> str:
-    print()
-    print("Audio Live Transcription")
-    print("------------------------")
-    for key, (_code, label) in ENGINES.items():
-        print(f"  {key}) {label}")
-    print("  q) Quit")
-    print()
-    while True:
-        choice = input("Choose engine [1-4]: ").strip().lower()
-        if choice in ("q", "quit", "exit"):
-            sys.exit(0)
-        if choice in ENGINES:
-            return ENGINES[choice][0]
-        if choice in ALIASES:
-            return ALIASES[choice]
-        print("Invalid choice. Enter 1–4 or q.")
-
-
-def _build_engine(code: str):
-    if code == "iflytek":
-        from engines.iflytek import IflytekEngine
-
-        return IflytekEngine()
-    if code == "sensevoice":
-        from engines.sensevoice import SenseVoiceEngine
-
-        return SenseVoiceEngine()
-    if code == "parakeet":
-        from engines.parakeet import ParakeetEngine
-
-        return ParakeetEngine()
-    if code == "whisper":
-        from engines.whisper import WhisperTurboEngine
-
-        return WhisperTurboEngine()
-    raise SystemExit(f"Unknown engine: {code}")
-
-
-def _print_partial(text: str) -> None:
-    sys.stdout.write(f"\r\033[K~ {text}")
-    sys.stdout.flush()
-
-
-def _print_final(text: str) -> None:
-    sys.stdout.write(f"\r\033[K> {text}\n")
-    sys.stdout.flush()
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Live microphone transcription (terminal only)."
+        description="Live microphone transcription — interactive TUI by default."
+    )
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Use the old non-TUI menu/argparse CLI instead of the full-screen TUI.",
     )
     parser.add_argument(
         "-e",
         "--engine",
-        choices=sorted(set(ALIASES.values())),
-        help="Skip the menu and start this engine.",
+        choices=["iflytek", "sensevoice", "parakeet", "whisper"],
+        help="With --cli: start this engine without a menu.",
     )
     parser.add_argument(
         "--list",
         action="store_true",
         help="List engines and exit.",
     )
-    args = parser.parse_args(argv)
+    args, rest = parser.parse_known_args(argv)
 
     if args.list:
-        for key, (code, label) in ENGINES.items():
-            print(f"{key}  {code:12}  {label}")
+        from tui_app import ENGINES
+
+        for i, opt in enumerate(ENGINES, 1):
+            print(f"{i}  {opt.code:12}  {opt.title}")
         return 0
 
-    code = args.engine or _print_menu()
-    engine = _build_engine(code)
-    print(f"\nStarting: {engine.name}")
+    if args.cli or args.engine:
+        return _legacy_cli(args.engine)
+
+    from tui_app import run_tui
+
+    run_tui()
+    return 0
+
+
+def _legacy_cli(engine: str | None) -> int:
+    """Kept for scripting; prefer the TUI."""
+    from tui_app import ENGINES, _build_engine
+
+    code = engine
+    if not code:
+        print("Audio Live Transcription (legacy CLI)")
+        for i, opt in enumerate(ENGINES, 1):
+            print(f"  {i}) {opt.title}")
+        print("  q) Quit")
+        while True:
+            choice = input("Choose engine [1-4]: ").strip().lower()
+            if choice in ("q", "quit", "exit"):
+                return 0
+            if choice.isdigit() and 1 <= int(choice) <= len(ENGINES):
+                code = ENGINES[int(choice) - 1].code
+                break
+            print("Invalid choice.")
+
+    eng = _build_engine(code)
+    print(f"\nStarting: {eng.name}")
     print("Speak into the mic. Press Ctrl+C to stop.\n")
 
+    def on_partial(text: str) -> None:
+        sys.stdout.write(f"\r\033[K~ {text}")
+        sys.stdout.flush()
+
+    def on_final(text: str) -> None:
+        sys.stdout.write(f"\r\033[K> {text}\n")
+        sys.stdout.flush()
+
     try:
-        summary = engine.run(_print_partial, _print_final)
+        summary = eng.run(on_partial, on_final)
     except KeyboardInterrupt:
         print("\nStopped.")
         return 0
-
     print("\n--- Summary ---")
     print(summary.short_text())
     return 1 if summary.error else 0

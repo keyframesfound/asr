@@ -1,6 +1,7 @@
 """Shared types for live transcription engines."""
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable
@@ -43,5 +44,6 @@ class LiveEngine(ABC):
         on_final: OnFinal,
         *,
         sample_rate: int = 16000,
+        stop_event: threading.Event | None = None,
     ) -> SessionSummary:
-        """Block until Ctrl+C / stop; print via callbacks; return summary."""
+        """Block until stop_event / Ctrl+C; print via callbacks; return summary."""
