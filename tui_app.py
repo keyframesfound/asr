@@ -10,6 +10,7 @@ from textual.binding import Binding
 from textual.containers import Container, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import Screen
+from rich.markup import escape
 from textual.widgets import Footer, Header, Label, ListItem, ListView, RichLog, Static
 
 # Patch tqdm before any engine load — Textual's FDs break multiprocessing locks.
@@ -146,7 +147,7 @@ class ListeningScreen(Screen):
             yield Static("m models · Ctrl+C stop · q quit", id="listen-hint")
             yield Static("Status: starting…", id="status")
             with VerticalScroll(id="log-scroll"):
-                yield RichLog(id="transcript", highlight=True, markup=True, wrap=True)
+                yield RichLog(id="transcript", highlight=False, markup=True, wrap=True)
             yield Static("", id="partial")
         yield Footer()
 
@@ -203,23 +204,23 @@ class ListeningScreen(Screen):
 
     @on(PartialText)
     def show_partial(self, event: PartialText) -> None:
-        self.query_one("#partial", Static).update(f"~ {event.text}")
+        self.query_one("#partial", Static).update(f"~ {event.text}")  # Static is plain text
 
     @on(FinalText)
     def show_final(self, event: FinalText) -> None:
         self.query_one("#partial", Static).update("")
-        self.query_one("#transcript", RichLog).write(f"[bold]>[/] {event.text}")
+        self.query_one("#transcript", RichLog).write(f"[bold]>[/] {escape(event.text)}")
 
     @on(SessionDone)
     def session_done(self, event: SessionDone) -> None:
         status = self.query_one("#status", Static)
         if event.error:
             status.update(f"Status: error — {event.error}")
-            self.query_one("#transcript", RichLog).write(f"[red]{event.error}[/]")
+            self.query_one("#transcript", RichLog).write(f"[red]{escape(event.error)}[/]")
         else:
             status.update("Status: stopped")
         self.query_one("#transcript", RichLog).write("")
-        self.query_one("#transcript", RichLog).write(f"[dim]{event.summary}[/]")
+        self.query_one("#transcript", RichLog).write(f"[dim]{escape(event.summary)}[/]")
 
 
 class AudioLiveApp(App[None]):
