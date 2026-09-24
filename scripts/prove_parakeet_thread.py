@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove Parakeet MLX works from background threads (no Stream(cpu) error)."""
+"""Prove Parakeet MLX works from background threads (no Stream(gpu/cpu) error)."""
 from __future__ import annotations
 
 import sys
@@ -17,10 +17,10 @@ def _worker_once(label: str, results: dict) -> None:
     import engines.parakeet as pk
 
     try:
-        mx_mod, stream = pk._bind_mlx_on_this_thread()
         info = pk.preload()
+        stream = pk._MODEL_STREAM
         audio = np.zeros(int(pk.FEED_SEC * 16000), dtype=np.float32)
-        with mx_mod.stream(stream):
+        with mx.stream(stream):
             with pk._MODEL.transcribe_stream() as asr:
                 asr.add_audio(mx.array(audio))
                 asr.add_audio(mx.array(audio))
@@ -28,6 +28,12 @@ def _worker_once(label: str, results: dict) -> None:
         results[label] = f"PASS ({info})"
     except Exception as exc:  # noqa: BLE001
         results[label] = f"FAIL: {exc}"
+    finally:
+        # Drop this thread's stream so the next worker can bind a new one.
+        try:
+            pk._end_worker_stream()
+        except Exception:
+            pass
 
 
 def main() -> int:
@@ -76,7 +82,7 @@ def main() -> int:
         stop.set()
         t3.join(timeout=30)
         run_result = run_err[0] if run_err else "FAIL: no result"
-        if "Stream(cpu" in run_result:
+        if "Stream(cpu" in run_result or "Stream(gpu" in run_result:
             results["run"] = f"FAIL: {run_result}"
         elif run_result == "OK" or "Input" in run_result or "device" in run_result.lower():
             # Mic errors are OK for this prove; stream error is not.
