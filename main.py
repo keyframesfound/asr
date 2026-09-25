@@ -27,6 +27,10 @@ def _configure_hub_offline() -> None:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    # HF's Xet transfer bridge can stall at zero bytes on some HK routes; the
+    # plain CDN HTTP path is slower but always moves. Must be set before
+    # huggingface_hub reads its constants (i.e. before transformers imports).
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 
 _configure_hub_offline()

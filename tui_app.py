@@ -25,6 +25,7 @@ from textual.timer import Timer
 from textual.widgets import Button, Input, ListItem, ListView, RichLog, Static
 
 from engines import level as level_bus
+from engines import weights as weights_bus
 from engines.audio_util import is_cjk as _is_cjk
 from engines.config import load_audio_config, load_config, save_config
 
@@ -651,12 +652,23 @@ class ActionButton(Button):
 
 
 class ModelPickerScreen(Screen):
-    """Arrow-key model picker. Defaults to config default_engine (parakeet)."""
+    """Arrow-key model picker. Defaults to config default_engine (parakeet).
+
+    Local engines show install state; i downloads missing weights, u removes
+    them again (second press confirms). Enter on a not-installed model stays
+    here with a hint instead of starting a doomed session.
+    """
 
     BINDINGS = [
+        Binding("i", "download_model", "Download", show=False),
+        Binding("u", "remove_model", "Remove", show=False),
         Binding("escape", "back", "Back", show=False),
         Binding("q", "app.quit", "Quit", show=False),
     ]
+
+    # A second u press within this window confirms the removal.
+    REMOVE_CONFIRM_SEC = 6.0
+    NOTE_TTL_SEC = 6.0
 
     def __init__(self, can_go_back: bool = False) -> None:
         super().__init__()
@@ -679,6 +691,7 @@ class ModelPickerScreen(Screen):
                     Vertical(
                         Static(title, classes="model-title"),
                         Static(opt.blurb, classes="model-blurb"),
+                        Static("", classes="model-status"),
                         classes="model-copy",
                     ),
                     id=f"eng-{opt.code}",
@@ -686,10 +699,11 @@ class ModelPickerScreen(Screen):
                 )
                 items.append(item)
             yield ListView(*items, id="model-list")
+            yield Static("", id="picker-note")
         hints = [("↑↓", "navigate"), ("enter", "select")]
         if self._can_go_back:
             hints.append(("esc", "back"))
-        hints.append(("q", "quit"))
+        hints.extend([("i", "download"), ("u", "remove"), ("q", "quit")])
         yield KeyHint(hints, id="keyhint")
 
     def on_mount(self) -> None:
@@ -700,17 +714,133 @@ class ModelPickerScreen(Screen):
             if opt.code == code:
                 lv.index = i
                 break
+        self._armed_remove = ""
+        self._armed_at = 0.0
+        self._note_text = ""
+        self._note_at = 0.0
+        self._downloading: set[str] = set()
+        if weights_bus.is_local_engine(code) and not weights_bus.weights_present(code):
+            self._flash(f"{self._title(code)} (default) is not installed — press i to download")
+        self._refresh_rows()
+        self.set_interval(0.5, self._refresh_rows)
 
     def action_back(self) -> None:
         if self._can_go_back:
             self.app.pop_screen()
 
+    # -- helpers -----------------------------------------------------------
+
+    def _title(self, code: str) -> str:
+        for opt in ENGINES:
+            if opt.code == code:
+                return opt.title
+        return code
+
+    def _selected_code(self) -> str:
+        lv = self.query_one("#model-list", ListView)
+        idx = lv.index or 0
+        if 0 <= idx < len(lv.children):
+            return (lv.children[idx].id or "").removeprefix("eng-")
+        return ""
+
+    def _flash(self, msg: str) -> None:
+        self._note_text = msg
+        self._note_at = time.monotonic()
+        self.query_one("#picker-note", Static).update(Text(msg, style=f"italic {_ACCENT}"))
+
+    def _progress_text(self, state) -> str:
+        if state.total > 0:
+            pct = min(100, int(100 * state.downloaded / state.total))
+            bits = [f"downloading… {pct}%"]
+        else:
+            bits = [f"downloading… {weights_bus.human_size(state.downloaded)}"]
+        if state.speed > 0:
+            bits.append(f"{weights_bus.human_size(state.speed)}/s")
+        if state.total > 0 and state.speed > 0 and state.downloaded < state.total:
+            eta = (state.total - state.downloaded) / state.speed
+            bits.append(f"~{weights_bus.human_eta(eta)} left")
+        return " · ".join(bits)
+
+    def _status_text(self, code: str) -> Text:
+        if not weights_bus.is_local_engine(code):
+            return Text("cloud · nothing to download", style=f"italic {_MUTED}")
+        state = weights_bus.download_state(code)
+        if state.running:
+            return Text(self._progress_text(state), style=f"italic {_ACCENT}")
+        if state.error:
+            msg = state.error if len(state.error) <= 64 else state.error[:61] + "…"
+            return Text(f"download failed — {msg} · press i to retry", style="italic #c96f6f")
+        if weights_bus.weights_present(code):
+            size = weights_bus.human_size(weights_bus.weights_size(code))
+            return Text(f"installed · {size}", style=f"italic {_MUTED}")
+        return Text("not installed · press i to download", style=f"italic {_ACCENT}")
+
+    def _refresh_rows(self) -> None:
+        for opt in ENGINES:
+            try:
+                row = self.query_one(f"#eng-{opt.code} .model-status", Static)
+            except Exception:
+                continue
+            state = weights_bus.download_state(opt.code)
+            # Announce the moment an in-flight download lands or fails — the
+            # row text below updates on the same tick.
+            if opt.code in self._downloading and not state.running:
+                self._downloading.discard(opt.code)
+                if not state.error:
+                    size = weights_bus.human_size(state.downloaded)
+                    self._flash(f"downloaded {self._title(opt.code)} · {size} ✓")
+            elif state.running:
+                self._downloading.add(opt.code)
+            row.update(self._status_text(opt.code))
+        if self._note_text and time.monotonic() - self._note_at > self.NOTE_TTL_SEC:
+            self._note_text = ""
+            self.query_one("#picker-note", Static).update("")
+        if self._armed_remove and time.monotonic() - self._armed_at > self.REMOVE_CONFIRM_SEC:
+            self._armed_remove = ""
+
+    # -- keys ---------------------------------------------------------------
+
     @on(ListView.Selected)
     def on_selected(self, event: ListView.Selected) -> None:
         item_id = event.item.id or ""
         code = item_id.removeprefix("eng-")
-        if code:
-            self.post_message(ModelPicked(code))
+        if not code:
+            return
+        if weights_bus.is_local_engine(code) and not weights_bus.weights_present(code):
+            self._flash(f"{self._title(code)} is not installed — press i to download")
+            return
+        self.post_message(ModelPicked(code))
+
+    def action_download_model(self) -> None:
+        code = self._selected_code()
+        if not weights_bus.is_local_engine(code):
+            self._flash(f"{self._title(code)} streams from the cloud — no weights")
+            return
+        if weights_bus.weights_present(code):
+            self._flash(f"{self._title(code)} is already installed")
+            return
+        if weights_bus.download_weights_async(code):
+            self._armed_remove = ""
+            self._flash(f"downloading {self._title(code)}…")
+        else:
+            self._flash(f"{self._title(code)} is already downloading")
+
+    def action_remove_model(self) -> None:
+        code = self._selected_code()
+        if not weights_bus.is_local_engine(code):
+            self._flash(f"{self._title(code)} streams from the cloud — nothing to remove")
+            return
+        if not weights_bus.weights_present(code):
+            self._flash(f"{self._title(code)} is not installed")
+            return
+        if self._armed_remove != code:
+            self._armed_remove, self._armed_at = code, time.monotonic()
+            size = weights_bus.human_size(weights_bus.weights_size(code))
+            self._flash(f"press u again to remove {self._title(code)} ({size})")
+            return
+        self._armed_remove = ""
+        freed = weights_bus.remove_weights(code)
+        self._flash(f"removed {self._title(code)} — freed {freed}")
 
 
 class ListeningScreen(Screen):
@@ -1465,6 +1595,16 @@ class AudioLiveApp(App[None]):
         color: #565656;
         text-style: none;
         margin-top: 0;
+    }
+    .model-status {
+        height: auto;
+        margin-top: 0;
+    }
+    /* install/remove hints from the picker (i / u) */
+    #picker-note {
+        height: 1;
+        padding: 0 1;
+        color: #e8a87c;
     }
     /* ListItem sets `-highlight` (single dash) on the highlighted row. */
     ListItem.-highlight {

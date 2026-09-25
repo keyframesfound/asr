@@ -13,17 +13,41 @@ Claude Code / OpenCode–inspired TUI: slim chrome, keyboard-first. Arrow-key mo
 
 Model weights are **not** in git. `scripts/download_models.py` fetches the three local engines into `models/` after pip install. Whisper and SenseVoice prefer the GitHub [`models-v1`](https://github.com/keyframesfound/asr/releases/tag/models-v1) release tarballs (`whisper-large-v3-turbo.tar`, `sensevoice-small.tar`), which unpack to `models/<dirname>/`. Hugging Face LFS (`cdn-lfs.huggingface.co`) can stall after a few MB on some networks; if that release fetch fails, the script falls back to the Hugging Face snapshot. Parakeet stays on Hugging Face (the weights are over GitHub’s 2 GiB asset limit). iFlytek stays cloud-only. If Parakeet’s cache is still empty, `./run` can download it on first use; it does not re-download once the weights are present.
 
+### Model manager (download / uninstall in-app)
+
+The model picker shows each engine's install state (`installed · 1.5 GB`, `not installed`, `downloading…`):
+
+- **i** — download the highlighted model's weights (runs in the background; the row shows live percentage, MB/s and a time-remaining countdown, and flips to *installed* the moment the download is verified).
+- **u** — uninstall: press twice to confirm, weights are deleted from `models/`.
+
+A download only counts as done once the real weights blob is verified on disk (the actual safetensors/bin file, not just config leftovers); an interrupted download stays *not installed* and resumes where it left off. Sources are the same as above; override the release source with `ASR_WEIGHTS_BASE_URL` (set `off` to go straight to HF).
+
 ## Setup
 
-Local Whisper, SenseVoice, and Parakeet weights are about **5 GB** and need a network connection. They are not committed. iFlytek has no download.
+One command on a fresh Mac — no Homebrew, Xcode tools, or Python needed beforehand:
 
 ```bash
-cd ~/iflytek-live-asr   # or: git clone https://github.com/keyframesfound/asr
+curl -fsSL https://raw.githubusercontent.com/keyframesfound/asr/main/install.sh | bash
+```
+
+This installs everything (uv + Python + dependencies), pre-downloads the three local models (~5 GB), puts a global `asr` command on PATH, and seeds `.env`. Rerun the same command to update an existing install — `.env`, `config.json`, and downloaded `models/` are kept. From an existing clone, `./install.sh` does the same from that copy (skip the model downloads with `ASR_NO_MODELS=1`).
+
+Installing machines that should also have **SenseVoice (Cantonese)** or **Whisper**? Their weights are not auto-downloaded — provision them from a machine that has them:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/keyframesfound/asr/main/install.sh | ASR_WEIGHTS_SRC="$HOME/Documents/VS Code/asr/models" bash
+```
+
+Manual equivalent, if you prefer:
+
+```bash
+git clone https://github.com/keyframesfound/asr ~/asr
+cd ~/asr
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python scripts/download_models.py
-cp .env.example .env    # fill iFlytek keys for cloud ASR
+cp .env.example .env    # fill iFlytek keys for cloud ASR (optional — local engines work without)
 ```
 
 `scripts/setup.sh` runs that sequence (venv, pip install, download). Re-running the download skips engines whose weights are already on disk. `./run` does not start a multi-GB download when those files are present.
