@@ -11,7 +11,7 @@ Claude Code / OpenCode–inspired TUI: slim chrome, keyboard-first. Arrow-key mo
 3. **Parakeet Unified EN** — local Parakeet TDT via **parakeet-mlx** (`mlx-community/parakeet-tdt-0.6b-v3`); weights live in `models/parakeet-mlx` (Apple Silicon).
 4. **Whisper Large V3 Turbo** — local under `models/whisper-large-v3-turbo`.
 
-Model weights are **not** in git. `scripts/download_models.py` fetches the three local engines into `models/` after pip install. iFlytek stays cloud-only. If Parakeet’s cache is still empty, `./run` can download it on first use; it does not re-download once the weights are present.
+Model weights are **not** in git. `scripts/download_models.py` fetches the three local engines into `models/` after pip install. Whisper and SenseVoice prefer the GitHub [`models-v1`](https://github.com/keyframesfound/asr/releases/tag/models-v1) release tarballs (`whisper-large-v3-turbo.tar`, `sensevoice-small.tar`), which unpack to `models/<dirname>/`. Hugging Face LFS (`cdn-lfs.huggingface.co`) can stall after a few MB on some networks; if that release fetch fails, the script falls back to the Hugging Face snapshot. Parakeet stays on Hugging Face (the weights are over GitHub’s 2 GiB asset limit). iFlytek stays cloud-only. If Parakeet’s cache is still empty, `./run` can download it on first use; it does not re-download once the weights are present.
 
 ## Setup
 
