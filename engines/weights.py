@@ -32,9 +32,12 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 # reads until exit, and a full pipe blocks the child mid-download.
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
-# Self-hosted weights on GitHub Releases (see models-v1): tried first for the
-# plain-directory engines, no login on either side. Override or disable with
-# ASR_WEIGHTS_BASE_URL (set it to "hf" or "off" to skip GitHub and use HF).
+# Self-hosted weight tarballs (tag models-v1), tried in order before the HF
+# hub. R2 first (no 2 GiB asset cap, so Parakeet rides the same path);
+# GitHub Releases second. No login on either side. Override the whole chain
+# with ASR_WEIGHTS_BASE_URL (set it to "hf" or "off" to skip tarballs and
+# use HF directly).
+DEFAULT_R2_BASE = "https://pub-f6dba6d3598843a0bf81e6cb54c57d5b.r2.dev/models-v1"
 DEFAULT_RELEASE_BASE = "https://github.com/keyframesfound/asr/releases/download/models-v1"
 
 # No byte growth for this long while "downloading" → flag a stall and let the
@@ -42,8 +45,12 @@ DEFAULT_RELEASE_BASE = "https://github.com/keyframesfound/asr/releases/download/
 STALL_TIMEOUT_SEC = 45
 
 
-def _release_base() -> str:
-    return os.environ.get("ASR_WEIGHTS_BASE_URL", DEFAULT_RELEASE_BASE).strip()
+def _tarball_bases() -> list[str]:
+    """Ordered self-hosted tarball sources; empty means skip straight to HF."""
+    override = os.environ.get("ASR_WEIGHTS_BASE_URL", "").strip()
+    if override:
+        return [] if override.lower() in ("hf", "off") else [override]
+    return [DEFAULT_R2_BASE, DEFAULT_RELEASE_BASE]
 
 MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
 
@@ -258,6 +265,10 @@ def _download_worker(code: str) -> None:
         # resumes from partial files, so just respawn on stall (exit 42).
         rc = 1
         err = ""
+        # Learn the expected size up front so % and ETA show from the first
+        # tick; skipped in test mode, which must never touch the network.
+        # The child's own `total` line (real Content-Length) still wins.
+        threading.Thread(target=_probe_total, args=(code,), daemon=True).start()
         for _attempt in range(3):
             proc = subprocess.Popen(
                 [sys.executable, "-m", "engines.weights_worker", code],
@@ -364,6 +375,52 @@ def _hf_total_bytes(repo: str) -> int:
         return sum(s.size or 0 for s in info.siblings or [])
     except Exception:
         return 0
+
+
+# models-v1 R2 tarball sizes, in bytes. Last-resort expected total when even
+# a HEAD probe can't learn the size (no Content-Length anywhere): without it
+# the picker shows a bare byte counter instead of % and time remaining.
+# Same discipline as the SHA pins in scripts/download_models.py — keep these
+# in sync whenever the tarballs are re-packed.
+EXPECTED_TARBALL_BYTES: dict[str, int] = {
+    "parakeet": 2_508_570_112,
+    "sensevoice": 936_693_248,
+    "whisper": 1_622_491_648,
+}
+
+
+def _probe_total_bytes(code: str) -> int:
+    """Expected tarball size from a HEAD request — 0 when it can't be known.
+
+    The streaming GET sometimes has no Content-Length (chunked responses via
+    proxies), which would leave the picker's percentage and ETA blank for the
+    whole download. A cheap HEAD per tarball base fills that in up front.
+    """
+    name = f"{HUB_REPOS[code][1].name}.tar"
+    for base in _tarball_bases():
+        try:
+            req = urllib.request.Request(
+                f"{base}/{name}", method="HEAD", headers={"User-Agent": "asr-weights"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                n = int(resp.headers.get("Content-Length") or 0)
+                if n > 0:
+                    return n
+        except (OSError, ValueError):
+            continue
+    return 0
+
+
+def _probe_total(code: str) -> None:
+    """Fill in the download's expected total, but never overwrite a known one."""
+    n = _probe_total_bytes(code)
+    if not n:
+        n = EXPECTED_TARBALL_BYTES.get(code, 0)
+    if n > 0:
+        with _lock:
+            state = _states.get(code)
+            if state is not None and not state.total:
+                state.total = n
 
 
 def _download_hf(repo: str, path: Path, kind: str, on_total=None) -> None:

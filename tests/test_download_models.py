@@ -8,6 +8,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -43,6 +44,8 @@ def _plant_parakeet(cache_dir: Path, *, weight_bytes: int = dm.MIN_WEIGHT_BYTES)
     _touch(blob, weight_bytes)
     _touch(snap / "config.json")
     link = snap / "model.safetensors"
+    if link.is_symlink():
+        link.unlink()
     link.symlink_to(Path("..") / ".." / "blobs" / "weights")
     return snap
 
@@ -139,7 +142,7 @@ class DownloadSkipTest(unittest.TestCase):
             )
             self.assertEqual(code, 0)
 
-    def test_release_first_for_dir_engines_and_hub_only_for_parakeet(self) -> None:
+    def test_release_first_for_all_engines_and_hub_unused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             release_urls: list[str] = []
@@ -147,23 +150,20 @@ class DownloadSkipTest(unittest.TestCase):
 
             def _release(url: str, dest: Path) -> None:
                 release_urls.append(url)
-                if url == dm.release_asset_url(dm.WHISPER_DIRNAME):
+                if url == dm.tarball_url(dm.R2_BASE_URL, dm.WHISPER_DIRNAME):
                     self.assertEqual(dest, dm.model_dest(root, "whisper"))
                     _plant_whisper(dest)
-                elif url == dm.release_asset_url(dm.SENSEVOICE_DIRNAME):
+                elif url == dm.tarball_url(dm.R2_BASE_URL, dm.SENSEVOICE_DIRNAME):
                     self.assertEqual(dest, dm.model_dest(root, "sensevoice"))
                     _plant_sensevoice(dest)
+                elif url == dm.tarball_url(dm.R2_BASE_URL, dm.PARAKEET_DIRNAME):
+                    self.assertEqual(dest, dm.model_dest(root, "parakeet"))
+                    _plant_parakeet(dest)
                 else:
                     raise AssertionError(url)
 
-            def _hub(**kwargs: object) -> str:
-                repo = kwargs["repo_id"]
-                hub_repos.append(repo)
-                if repo != dm.PARAKEET_REPO_ID:
-                    raise AssertionError(f"hub should not run for {repo}")
-                self.assertNotIn("local_dir", kwargs)
-                _plant_parakeet(Path(str(kwargs["cache_dir"])))
-                return "ok"
+            def _hub(**_kwargs: object) -> str:
+                raise AssertionError("hub should not run when tarballs succeed")
 
             self.assertEqual(
                 dm.download_local_models(
@@ -174,20 +174,11 @@ class DownloadSkipTest(unittest.TestCase):
             self.assertEqual(
                 release_urls,
                 [
-                    dm.release_asset_url(dm.WHISPER_DIRNAME),
-                    dm.release_asset_url(dm.SENSEVOICE_DIRNAME),
+                    dm.tarball_url(dm.R2_BASE_URL, dm.WHISPER_DIRNAME),
+                    dm.tarball_url(dm.R2_BASE_URL, dm.SENSEVOICE_DIRNAME),
+                    dm.tarball_url(dm.R2_BASE_URL, dm.PARAKEET_DIRNAME),
                 ],
             )
-            self.assertEqual(hub_repos, [dm.PARAKEET_REPO_ID])
-            release_urls.clear()
-            hub_repos.clear()
-            self.assertEqual(
-                dm.download_local_models(
-                    root, downloader=_hub, release_fetcher=_release
-                ),
-                0,
-            )
-            self.assertEqual(release_urls, [])
             self.assertEqual(hub_repos, [])
 
     def test_release_failure_falls_back_to_huggingface(self) -> None:
@@ -229,8 +220,12 @@ class DownloadSkipTest(unittest.TestCase):
             self.assertEqual(
                 release_urls,
                 [
-                    dm.release_asset_url(dm.WHISPER_DIRNAME),
-                    dm.release_asset_url(dm.SENSEVOICE_DIRNAME),
+                    dm.tarball_url(dm.R2_BASE_URL, dm.WHISPER_DIRNAME),
+                    dm.tarball_url(dm.RELEASE_BASE_URL, dm.WHISPER_DIRNAME),
+                    dm.tarball_url(dm.R2_BASE_URL, dm.SENSEVOICE_DIRNAME),
+                    dm.tarball_url(dm.RELEASE_BASE_URL, dm.SENSEVOICE_DIRNAME),
+                    dm.tarball_url(dm.R2_BASE_URL, dm.PARAKEET_DIRNAME),
+                    dm.tarball_url(dm.RELEASE_BASE_URL, dm.PARAKEET_DIRNAME),
                 ],
             )
             self.assertEqual(
@@ -242,12 +237,19 @@ class DownloadSkipTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             hub_repos: list[object] = []
+            planted: set[str] = set()
 
             def _release(url: str, dest: Path) -> None:
-                if url.endswith(f"{dm.WHISPER_DIRNAME}.tar"):
+                key = url.rsplit("/", 1)[-1]
+                if key in planted:
+                    return  # second source, same unusable tree
+                planted.add(key)
+                if key == f"{dm.WHISPER_DIRNAME}.tar":
                     _plant_whisper(dest, weight_bytes=128)
-                elif url.endswith(f"{dm.SENSEVOICE_DIRNAME}.tar"):
+                elif key == f"{dm.SENSEVOICE_DIRNAME}.tar":
                     _plant_sensevoice(dest, weight_bytes=128)
+                elif key == f"{dm.PARAKEET_DIRNAME}.tar":
+                    _plant_parakeet(dest, weight_bytes=128)
                 else:
                     raise AssertionError(url)
 
@@ -318,21 +320,47 @@ class DownloadSkipTest(unittest.TestCase):
 
 
 class ReleaseArchiveTest(unittest.TestCase):
-    def test_asset_urls_and_checksums_cover_dir_engines_only(self) -> None:
+    def test_tarball_urls_and_per_source_checksums(self) -> None:
         self.assertEqual(
-            dm.release_asset_url(dm.WHISPER_DIRNAME),
-            "https://github.com/keyframesfound/asr/releases/download/"
-            "models-v1/whisper-large-v3-turbo.tar",
+            dm.tarball_url(dm.R2_BASE_URL, dm.WHISPER_DIRNAME),
+            "https://pub-f6dba6d3598843a0bf81e6cb54c57d5b.r2.dev"
+            "/models-v1/whisper-large-v3-turbo.tar",
         )
         self.assertEqual(
-            dm.release_asset_url(dm.SENSEVOICE_DIRNAME),
+            dm.tarball_url(dm.RELEASE_BASE_URL, dm.SENSEVOICE_DIRNAME),
             "https://github.com/keyframesfound/asr/releases/download/"
             "models-v1/sensevoice-small.tar",
         )
-        self.assertIn(f"{dm.WHISPER_DIRNAME}.tar", dm.RELEASE_SHA256)
-        self.assertIn(f"{dm.SENSEVOICE_DIRNAME}.tar", dm.RELEASE_SHA256)
+        # R2 ships all three; the GitHub release only the dir engines.
+        self.assertEqual(
+            set(dm.R2_SHA256),
+            {
+                f"{dm.WHISPER_DIRNAME}.tar",
+                f"{dm.SENSEVOICE_DIRNAME}.tar",
+                f"{dm.PARAKEET_DIRNAME}.tar",
+            },
+        )
         self.assertNotIn(f"{dm.PARAKEET_DIRNAME}.tar", dm.RELEASE_SHA256)
-        self.assertIsNone(dm._release_dirname("parakeet"))
+        self.assertEqual(
+            dm._pinned_sha256(dm.tarball_url(dm.R2_BASE_URL, dm.PARAKEET_DIRNAME)),
+            dm.R2_SHA256[f"{dm.PARAKEET_DIRNAME}.tar"],
+        )
+        self.assertEqual(dm._pinned_sha256("https://example.com/anything.tar"), "")
+        self.assertEqual(dm._tarball_dirname("parakeet"), dm.PARAKEET_DIRNAME)
+
+    def test_source_chain_env_override(self) -> None:
+        with mock.patch.dict(os.environ, {"ASR_WEIGHTS_BASE_URL": "off"}):
+            self.assertEqual(dm._tarball_sources(), ())
+        with mock.patch.dict(os.environ, {"ASR_WEIGHTS_BASE_URL": "hf"}):
+            self.assertEqual(dm._tarball_sources(), ())
+        with mock.patch.dict(
+            os.environ, {"ASR_WEIGHTS_BASE_URL": "https://mirror.example/w"}
+        ):
+            self.assertEqual(dm._tarball_sources(), ("https://mirror.example/w",))
+        with mock.patch.dict(os.environ, {"ASR_WEIGHTS_BASE_URL": ""}):
+            self.assertEqual(
+                dm._tarball_sources(), (dm.R2_BASE_URL, dm.RELEASE_BASE_URL)
+            )
 
     def test_extract_strips_root_and_skips_appledouble(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

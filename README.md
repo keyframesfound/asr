@@ -11,7 +11,7 @@ Claude Code / OpenCode–inspired TUI: slim chrome, keyboard-first. Arrow-key mo
 3. **Parakeet Unified EN** — local Parakeet TDT via **parakeet-mlx** (`mlx-community/parakeet-tdt-0.6b-v3`); weights live in `models/parakeet-mlx` (Apple Silicon).
 4. **Whisper Large V3 Turbo** — local under `models/whisper-large-v3-turbo`.
 
-Model weights are **not** in git. `scripts/download_models.py` fetches the three local engines into `models/` after pip install. Whisper and SenseVoice prefer the GitHub [`models-v1`](https://github.com/keyframesfound/asr/releases/tag/models-v1) release tarballs (`whisper-large-v3-turbo.tar`, `sensevoice-small.tar`), which unpack to `models/<dirname>/`. Hugging Face LFS (`cdn-lfs.huggingface.co`) can stall after a few MB on some networks; if that release fetch fails, the script falls back to the Hugging Face snapshot. Parakeet stays on Hugging Face (the weights are over GitHub’s 2 GiB asset limit). iFlytek stays cloud-only. If Parakeet’s cache is still empty, `./run` can download it on first use; it does not re-download once the weights are present.
+Model weights are **not** in git. `scripts/download_models.py` fetches the three local engines into `models/` after pip install. All three prefer the self-hosted tarball mirrors — the R2 bucket (`pub-f6dba6d3598843a0bf81e6cb54c57d5b.r2.dev`, bucket `asr-weights`) first, then the GitHub [`models-v1`](https://github.com/keyframesfound/asr/releases/tag/models-v1) release (which has no Parakeet tar — it is over GitHub's 2 GiB asset cap) — each tarball pinned to a SHA-256 so a truncated body is never extracted. Hugging Face LFS (`cdn-lfs.huggingface.co`) can stall after a few MB on some networks; only when every tarball source fails does the script fall back to the Hugging Face snapshot. iFlytek stays cloud-only. If Parakeet's cache is still empty, `./run` can download it on first use; it does not re-download once the weights are present.
 
 ### Model manager (download / uninstall in-app)
 
@@ -20,7 +20,7 @@ The model picker shows each engine's install state (`installed · 1.5 GB`, `not 
 - **i** — download the highlighted model's weights (runs in the background; the row shows live percentage, MB/s and a time-remaining countdown, and flips to *installed* the moment the download is verified).
 - **u** — uninstall: press twice to confirm, weights are deleted from `models/`.
 
-A download only counts as done once the real weights blob is verified on disk (the actual safetensors/bin file, not just config leftovers); an interrupted download stays *not installed* and resumes where it left off. Sources are the same as above; override the release source with `ASR_WEIGHTS_BASE_URL` (set `off` to go straight to HF).
+A download only counts as done once the real weights blob is verified on disk (the actual safetensors/bin file, not just config leftovers); an interrupted download stays *not installed* and resumes where it left off. Sources are the same as above; override the tarball source chain with `ASR_WEIGHTS_BASE_URL` (set `off` to go straight to HF).
 
 ## Setup
 

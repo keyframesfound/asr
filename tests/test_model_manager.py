@@ -55,6 +55,49 @@ class HumanSizeTest(unittest.TestCase):
         self.assertEqual(weights_bus.human_size(int(1.5 * 1024**3)), "1.5 GB")
 
 
+class ProbeTotalTest(unittest.TestCase):
+    """The HEAD probe must fill in an unknown total — and only then."""
+
+    def setUp(self) -> None:
+        self.paths = _patch_hubs(self)
+
+    def test_probe_reads_head_content_length(self) -> None:
+        resp = mock.MagicMock()
+        resp.headers = {"Content-Length": "1234"}
+        resp.__enter__ = mock.MagicMock(return_value=resp)
+        resp.__exit__ = mock.MagicMock(return_value=False)
+        with mock.patch.dict(
+            os.environ, {"ASR_WEIGHTS_BASE_URL": "https://example.com/base"}
+        ), mock.patch.object(
+            weights_bus.urllib.request, "urlopen", return_value=resp
+        ) as urlopen:
+            self.assertEqual(weights_bus._probe_total_bytes("whisper"), 1234)
+            urlopen.assert_called_once()
+            self.assertIn("whisper-large-v3-turbo.tar", urlopen.call_args.args[0].full_url)
+
+    def test_probe_failure_falls_back_to_pin(self) -> None:
+        state = weights_bus.DownloadState(running=True)
+        with mock.patch.dict(weights_bus._states, {"whisper": state}):
+            with mock.patch.object(
+                weights_bus, "_probe_total_bytes", return_value=0
+            ):
+                weights_bus._probe_total("whisper")
+        self.assertEqual(
+            state.total, weights_bus.EXPECTED_TARBALL_BYTES["whisper"]
+        )
+
+    def test_probe_total_fills_unknown_never_overrides(self) -> None:
+        state = weights_bus.DownloadState(running=True)
+        with mock.patch.dict(weights_bus._states, {"whisper": state}):
+            with mock.patch.object(weights_bus, "_probe_total_bytes", return_value=1234):
+                weights_bus._probe_total("whisper")
+            self.assertEqual(state.total, 1234)
+            # A second probe (retry) must not clobber the known total.
+            with mock.patch.object(weights_bus, "_probe_total_bytes", return_value=999):
+                weights_bus._probe_total("whisper")
+            self.assertEqual(state.total, 1234)
+
+
 class WeightsStatusTest(unittest.TestCase):
     def setUp(self) -> None:
         self.paths = _patch_hubs(self)
@@ -209,6 +252,50 @@ class WeightsStatusTest(unittest.TestCase):
             self._wait_idle("whisper")
         self.assertTrue(weights_bus.weights_present("whisper"))
 
+    def test_source_chain_r2_before_github(self) -> None:
+        """Default chain tries R2 first; GitHub is only the fallback."""
+        target = self.paths["sensevoice"]
+        r2 = Path(tempfile.mkdtemp())
+        github = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(r2, ignore_errors=True))
+        self.addCleanup(lambda: shutil.rmtree(github, ignore_errors=True))
+
+        # Both sources serve a valid tar with distinct payloads; the chain
+        # must install R2's copy, proving GitHub is only the fallback.
+        for base, blob in ((r2, b"x" * 512), (github, b"g" * 512)):
+            payload = base / "payload" / target.name
+            payload.mkdir(parents=True)
+            (payload / "model.pt").write_bytes(blob)
+            with tarfile.open(base / f"{target.name}.tar", "w") as tf:
+                tf.add(payload, arcname=target.name)
+            shutil.rmtree(payload)
+
+        env = mock.patch.dict(
+            os.environ,
+            {
+                "ASR_WEIGHTS_BASE_URL": "",
+                "ASR_WEIGHTS_INPROC": "1",
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        r2_base = mock.patch.object(weights_bus, "DEFAULT_R2_BASE", f"file://{r2}")
+        r2_base.start()
+        self.addCleanup(r2_base.stop)
+        gh_base = mock.patch.object(
+            weights_bus, "DEFAULT_RELEASE_BASE", f"file://{github}"
+        )
+        gh_base.start()
+        self.addCleanup(gh_base.stop)
+
+        with mock.patch("huggingface_hub.snapshot_download") as hub:
+            self.assertTrue(weights_bus.download_weights_async("sensevoice"))
+            self._wait_idle("sensevoice")
+            hub.assert_not_called()
+        self.assertTrue(weights_bus.weights_present("sensevoice"))
+        self.assertEqual((target / "model.pt").read_bytes(), b"x" * 512)
+        self.assertEqual(weights_bus.download_state("sensevoice").error, "")
+
     def test_stall_watchdog(self) -> None:
         """A download that stops moving is flagged instead of spinning forever."""
         target = self.paths["sensevoice"]
@@ -270,15 +357,18 @@ class PickerWiringTest(unittest.IsolatedAsyncioTestCase):
             iflytek_status = str(app.screen.query_one("#eng-iflytek .model-status").render())
             self.assertIn("cloud", iflytek_status)
 
-            # Navigate to Whisper (missing) and try to start — stay on the picker.
+            # Navigate to Whisper (missing): enter starts the download and
+            # stays on the picker instead of starting a doomed session.
             await pilot.press("down", "enter")
             await pilot.pause()
             self.assertIsInstance(app.screen, ModelPickerScreen)
+            self.assertEqual(started, ["whisper"])
 
-            # i starts the download via the weights bus.
+            # i is still a download trigger (the real bus refuses a second
+            # run; the mock always reports a fresh start).
             await pilot.press("i")
             await pilot.pause()
-            self.assertEqual(started, ["whisper"])
+            self.assertEqual(started, ["whisper", "whisper"])
 
             # u requires a second press to actually delete.
             await pilot.press("down")  # whisper → sensevoice

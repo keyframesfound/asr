@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """Download local ASR weights into ``models/`` (idempotent).
 
-Whisper and SenseVoice prefer the GitHub ``models-v1`` release tarballs
-(``whisper-large-v3-turbo.tar``, ``sensevoice-small.tar``). Each archive is
+All three engines prefer the self-hosted tarballs (see ``_tarball_sources``):
+the R2 bucket first, then the GitHub ``models-v1`` release. Each archive is
 rooted at ``<dirname>/`` and unpacks to ``models/<dirname>/``, the same
 layout ``from_pretrained`` / FunASR ``AutoModel`` already load from disk.
+Every source pins a SHA-256 per tarball; a mismatch refuses extraction.
 Hugging Face LFS (``cdn-lfs.huggingface.co``) can stall after a few MB on
-networks where that CDN is unreachable; if the release fetch fails, the
-script falls back to ``snapshot_download``.
-
-Parakeet is larger than GitHub's 2 GiB release-asset limit, so it stays on
-the Hugging Face hub cache layout that
-``parakeet_mlx.from_pretrained(..., cache_dir=models/parakeet-mlx)`` uses.
+networks where that CDN is unreachable; only when every tarball source fails
+does the script fall back to ``snapshot_download``.
 
 iFlytek is cloud-only. Hex / CoreML trees are not downloaded.
 
@@ -51,12 +48,30 @@ SENSEVOICE_FILES = (
 # Real weights are hundreds of MB. A git-lfs pointer is ~100 bytes.
 MIN_WEIGHT_BYTES = 10 * 1024 * 1024
 
-# GitHub release assets. Parakeet is omitted (over the 2 GiB asset limit).
+# Self-hosted tarball sources, tried in order. R2 has no asset-size cap, so
+# all three engines ship there; the GitHub release keeps only the two dir
+# engines (Parakeet is over its 2 GiB asset limit). ASR_WEIGHTS_BASE_URL
+# overrides the whole chain ("off"/"hf" skips tarballs for HF only), matching
+# engines.weights.
+R2_BASE_URL = "https://pub-f6dba6d3598843a0bf81e6cb54c57d5b.r2.dev/models-v1"
 RELEASE_TAG = "models-v1"
 RELEASE_BASE_URL = (
     f"https://github.com/keyframesfound/asr/releases/download/{RELEASE_TAG}"
 )
-# Pinned to models-v1 SHA256SUMS.txt so a truncated CDN body is not extracted.
+
+# Pinned SHA-256 per tarball, per source: the R2 tars and the GitHub assets
+# were packed separately, so their digests differ even for the same model.
+R2_SHA256 = {
+    f"{WHISPER_DIRNAME}.tar": (
+        "b2741ad525492bbf499cfc027794821378ea3e10af5f2d0036aad2ab0d6b75d5"
+    ),
+    f"{SENSEVOICE_DIRNAME}.tar": (
+        "145970816f13777fb61d6d370690b69f0978a5b43e0d6985d93281d06fad6bf3"
+    ),
+    f"{PARAKEET_DIRNAME}.tar": (
+        "963248a35390fe4d41d0eb34548e00af20e80e4dec255d1ed62dfe99f7b4ad43"
+    ),
+}
 RELEASE_SHA256 = {
     f"{WHISPER_DIRNAME}.tar": (
         "3133baf9fd6dd260ec17914974323e9c35697c98fca8f40ea33e8a486e460a59"
@@ -65,6 +80,13 @@ RELEASE_SHA256 = {
         "9b01ea831411f5aade6e9d5dcff69ffaeeee8b6b87be751a09bf7f086f0478d9"
     ),
 }
+
+# Ordered (base URL, pinned checksums) pairs; a source without a pin for a
+# tarball is skipped rather than downloaded unverified.
+SOURCE_SHA256: tuple[tuple[str, dict[str, str]], ...] = (
+    (R2_BASE_URL, R2_SHA256),
+    (RELEASE_BASE_URL, RELEASE_SHA256),
+)
 
 _OFFLINE_ENV = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE")
 _DOWNLOAD_CHUNK = 1024 * 1024
@@ -211,18 +233,36 @@ def _enable_network() -> None:
         )
 
 
-def release_asset_url(dirname: str) -> str:
-    """URL of a ``models-v1`` tarball named ``<dirname>.tar``."""
-    return f"{RELEASE_BASE_URL}/{dirname}.tar"
+def _tarball_sources() -> tuple[str, ...]:
+    """Ordered tarball base URLs; ASR_WEIGHTS_BASE_URL overrides, off/hf skips."""
+    override = os.environ.get("ASR_WEIGHTS_BASE_URL", "").strip()
+    if override:
+        return () if override.lower() in ("hf", "off") else (override,)
+    return tuple(base for base, _pins in SOURCE_SHA256)
 
 
-def _release_dirname(key: str) -> str | None:
-    """Directory engines shipped as GitHub release assets. Parakeet has none."""
+def tarball_url(base: str, dirname: str) -> str:
+    """URL of a tarball named ``<dirname>.tar`` under one source base."""
+    return f"{base}/{dirname}.tar"
+
+
+def _pinned_sha256(url: str) -> str:
+    """Pinned digest for a tarball URL; empty when the source does not ship it."""
+    for base, pins in SOURCE_SHA256:
+        if url.startswith(base + "/"):
+            return pins.get(url.rsplit("/", 1)[-1], "")
+    return ""
+
+
+def _tarball_dirname(key: str) -> str:
+    """Archive root name for an engine (``<dirname>.tar`` on every source)."""
     if key == "whisper":
         return WHISPER_DIRNAME
     if key == "sensevoice":
         return SENSEVOICE_DIRNAME
-    return None
+    if key == "parakeet":
+        return PARAKEET_DIRNAME
+    raise KeyError(key)
 
 
 def _remove_incomplete(path: Path) -> None:
@@ -246,15 +286,17 @@ def _short_error(exc: BaseException) -> str:
 
 
 def extract_release_archive(archive: Path, dest: Path) -> None:
-    """Unpack a ``models-v1`` tarball into ``dest``.
+    """Unpack a rooted tarball so its files land in ``dest``.
 
-    Members live under ``<dirname>/`` (``dest.name``). That prefix is
-    stripped so files land directly in ``dest``. macOS AppleDouble ``._*``
-    forks are skipped. A member outside that directory is refused.
+    Members live under ``<dirname>/`` (``dest.name``) and are extracted into
+    ``dest.parent`` — the tree keeps its root directory, so hub-cache
+    symlinks between ``blobs/`` and ``snapshots/`` resolve inside it. macOS
+    AppleDouble ``._*`` forks are skipped. A member outside that directory is
+    refused.
     """
     root = dest.name
     prefix = root + "/"
-    dest.mkdir(parents=True, exist_ok=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:*") as tar:
         selected: list[tarfile.TarInfo] = []
         for member in tar.getmembers():
@@ -273,13 +315,12 @@ def extract_release_archive(archive: Path, dest: Path) -> None:
                     f"release archive member {member.name!r} is outside {root}/"
                 )
             rel = name[len(prefix):]
-            if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+            if rel.startswith("/") or ".." in Path(rel).parts:
                 raise ValueError(f"unsafe archive member {member.name!r}")
-            member.name = rel
             selected.append(member)
         if not selected:
             raise ValueError(f"release archive contains no files for {root}/")
-        tar.extractall(dest, members=selected, filter="data")
+        tar.extractall(dest.parent, members=selected, filter="data")
 
 
 def _stream_download(url: str, dest: Path, timeout: float = _DOWNLOAD_TIMEOUT_SEC) -> str:
@@ -303,15 +344,15 @@ def _stream_download(url: str, dest: Path, timeout: float = _DOWNLOAD_TIMEOUT_SE
 
 
 def fetch_release_tarball(url: str, dest: Path) -> None:
-    """Download one release asset, verify its pinned checksum, and extract it.
+    """Download one tarball, verify its pinned checksum, and extract it.
 
     The partial file sits inside ``dest`` (gitignored with the rest of the
     model tree) and is removed when the fetch finishes or fails.
     """
-    filename = url.rstrip("/").rsplit("/", 1)[-1]
-    expected = RELEASE_SHA256.get(filename)
+    expected = _pinned_sha256(url)
     if not expected:
-        raise ValueError(f"no pinned checksum for release asset {filename}")
+        raise ValueError(f"no pinned checksum for tarball {url}")
+    filename = url.rstrip("/").rsplit("/", 1)[-1]
     dest.mkdir(parents=True, exist_ok=True)
     partial = dest / f".{filename}.partial"
     try:
@@ -373,36 +414,36 @@ def _fetch_hub(downloader: Downloader, spec: ModelSpec, dest: Path) -> None:
 
 
 def _try_release(spec: ModelSpec, dest: Path, release_fetcher: ReleaseFetcher) -> bool:
-    """Fetch the GitHub tarball. Return True when the tree is ready to load.
+    """Fetch the self-hosted tarball. Return True when the tree is ready.
 
-    Any fetch or layout failure is reported and returns False so the caller
-    can fall back to Hugging Face. ``AssertionError`` still propagates so a
-    test double fails the test instead of looking like a network error.
+    Sources are tried in order (R2, then GitHub). Any fetch, checksum, or
+    layout failure is reported and the next source takes over; when all fail
+    the caller falls back to Hugging Face. ``AssertionError`` still propagates
+    so a test double fails the test instead of looking like a network error.
     """
-    dirname = _release_dirname(spec.key)
-    if dirname is None:
-        return False
-    url = release_asset_url(dirname)
-    print(f"  release: {url}", flush=True)
-    try:
-        release_fetcher(url, dest)
-    except AssertionError:
-        raise
-    except Exception as exc:
+    dirname = _tarball_dirname(spec.key)
+    for base in _tarball_sources():
+        url = tarball_url(base, dirname)
+        print(f"  release: {url}", flush=True)
+        try:
+            release_fetcher(url, dest)
+        except AssertionError:
+            raise
+        except Exception as exc:
+            print(
+                f"[note] tarball fetch failed ({_short_error(exc)}); "
+                "trying the next source",
+                flush=True,
+            )
+            continue
+        _remove_incomplete(dest)
+        if weights_ready(spec.key, dest):
+            return True
         print(
-            f"[note] GitHub release fetch failed ({_short_error(exc)}); "
-            "falling back to Hugging Face",
+            "[note] tarball did not contain the required weight files; "
+            "trying the next source",
             flush=True,
         )
-        return False
-    _remove_incomplete(dest)
-    if weights_ready(spec.key, dest):
-        return True
-    print(
-        "[note] GitHub release did not contain the required weight files; "
-        "falling back to Hugging Face",
-        flush=True,
-    )
     return False
 
 
@@ -444,8 +485,8 @@ def download_local_models(
         flush=True,
     )
     print(
-        "Whisper and SenseVoice prefer the GitHub models-v1 release "
-        "(Hugging Face if that fetch fails). Parakeet uses Hugging Face.",
+        "All three engines prefer the self-hosted tarballs (R2, then the "
+        "GitHub models-v1 release; Hugging Face if those fail).",
         flush=True,
     )
     for spec in MODELS:

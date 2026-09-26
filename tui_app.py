@@ -13,16 +13,15 @@ from pathlib import Path
 import numpy as np
 
 from rich.align import Align
-from rich.markup import escape
 from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen, Screen
 from textual.timer import Timer
-from textual.widgets import Button, Input, ListItem, ListView, RichLog, Static
+from textual.widgets import Button, Input, ListItem, ListView, Static
 
 from engines import level as level_bus
 from engines import weights as weights_bus
@@ -654,9 +653,10 @@ class ActionButton(Button):
 class ModelPickerScreen(Screen):
     """Arrow-key model picker. Defaults to config default_engine (parakeet).
 
-    Local engines show install state; i downloads missing weights, u removes
-    them again (second press confirms). Enter on a not-installed model stays
-    here with a hint instead of starting a doomed session.
+    Local engines show install state; enter (or i) downloads missing weights,
+    u removes them again (second press confirms). Enter on a not-installed
+    model starts the download and stays here instead of starting a doomed
+    session.
     """
 
     BINDINGS = [
@@ -720,7 +720,7 @@ class ModelPickerScreen(Screen):
         self._note_at = 0.0
         self._downloading: set[str] = set()
         if weights_bus.is_local_engine(code) and not weights_bus.weights_present(code):
-            self._flash(f"{self._title(code)} (default) is not installed — press i to download")
+            self._flash(f"{self._title(code)} (default) is not installed — press enter to download")
         self._refresh_rows()
         self.set_interval(0.5, self._refresh_rows)
 
@@ -769,11 +769,11 @@ class ModelPickerScreen(Screen):
             return Text(self._progress_text(state), style=f"italic {_ACCENT}")
         if state.error:
             msg = state.error if len(state.error) <= 64 else state.error[:61] + "…"
-            return Text(f"download failed — {msg} · press i to retry", style="italic #c96f6f")
+            return Text(f"download failed — {msg} · press enter to retry", style="italic #c96f6f")
         if weights_bus.weights_present(code):
             size = weights_bus.human_size(weights_bus.weights_size(code))
             return Text(f"installed · {size}", style=f"italic {_MUTED}")
-        return Text("not installed · press i to download", style=f"italic {_ACCENT}")
+        return Text("not installed · press enter to download", style=f"italic {_ACCENT}")
 
     def _refresh_rows(self) -> None:
         for opt in ENGINES:
@@ -807,7 +807,9 @@ class ModelPickerScreen(Screen):
         if not code:
             return
         if weights_bus.is_local_engine(code) and not weights_bus.weights_present(code):
-            self._flash(f"{self._title(code)} is not installed — press i to download")
+            # Enter on a missing model downloads it (same as i) instead of
+            # starting a doomed session; it lands back here when done.
+            self.action_download_model()
             return
         self.post_message(ModelPicked(code))
 
@@ -844,9 +846,9 @@ class ModelPickerScreen(Screen):
 
 
 class ListeningScreen(Screen):
-    """Centered live caption + scrolling log + export + start/stop live ASR.
+    """Centered live caption + export + start/stop live ASR.
 
-    Caption and transcript use the terminal typeface. Textual CSS cannot
+    Caption and status use the terminal typeface. Textual CSS cannot
     set PingFang HK; see the stylesheet comment and README "Hong Kong CJK font".
     """
 
@@ -883,7 +885,7 @@ class ListeningScreen(Screen):
         self._cleared = False  # user cleared during/after the last session
         # listening | transcribing | polishing | live | stopped | loading
         self._ui_state = "stopped"
-        # Which main view fills the listen area: loading | live | record
+        # Which main view fills the listen area: loading | live
         self._view = "live"
 
     def compose(self) -> ComposeResult:
@@ -894,15 +896,6 @@ class ListeningScreen(Screen):
             yield LoadingPanel(id="loading-panel")
             with Vertical(id="caption-stage"):
                 yield AnimatedCaption(id="caption")
-            yield Static("", id="stage-rule", classes="rule")
-            with VerticalScroll(id="log-scroll"):
-                yield RichLog(
-                    id="transcript",
-                    highlight=False,
-                    markup=True,
-                    wrap=True,
-                    max_lines=2000,
-                )
             # Hidden partial sink — engines still write here; keep for status hooks
             yield Static("", id="partial", classes="partial-hidden")
         with Horizontal(id="action-bar"):
@@ -921,7 +914,7 @@ class ListeningScreen(Screen):
     def _top(self) -> TopBar:
         return self.query_one("#top-bar", TopBar)
 
-    # —— main view layouts: loading | live | record ——
+    # —— main view layouts: loading | live ——
 
     def _set_layout(self, view: str) -> None:
         """Swap which view fills the listen area; no-op when unchanged."""
@@ -931,14 +924,10 @@ class ListeningScreen(Screen):
         try:
             panel = self.query_one("#loading-panel", LoadingPanel)
             caption = self.query_one("#caption-stage")
-            rule = self.query_one("#stage-rule")
-            log = self.query_one("#log-scroll")
         except Exception:
             return  # not mounted yet
         panel.display = view == "loading"
         caption.display = view == "live"
-        rule.display = view == "live"
-        log.display = view in ("live", "record")
 
     def _show_loading(self, label: str, sub: str = "") -> None:
         self._set_layout("loading")
@@ -949,10 +938,6 @@ class ListeningScreen(Screen):
 
     def _show_live_layout(self) -> None:
         self._set_layout("live")
-
-    def _show_record_layout(self) -> None:
-        """Recording is done: the transcript log takes over the caption area."""
-        self._set_layout("record")
 
     def _set_live_ui(self, running: bool) -> None:
         self._session_running = running
@@ -1187,7 +1172,6 @@ class ListeningScreen(Screen):
         self._audio = None
         self._cleared = True  # a pending polish result should not resurrect text
         self.query_one("#meter", LevelMeter).set_counts(0, 0)
-        self.query_one("#transcript", RichLog).clear()
         self._set_caption_indicator("clear")
         self._show_live_layout()
         self._flash(f"cleared {cleared} lines", color=_MUTED)
@@ -1229,9 +1213,6 @@ class ListeningScreen(Screen):
             path.write_text(_export_body(self._lines), encoding="utf-8")
             self.query_one("#status", Static).update(
                 Text(f"exported → {path}", style=_SECONDARY)
-            )
-            self.query_one("#transcript", RichLog).write(
-                f"[dim]Exported {len(self._lines)} lines to {escape(str(path))}[/]"
             )
         except Exception as exc:  # noqa: BLE001
             self.query_one("#status", Static).update(
@@ -1280,44 +1261,36 @@ class ListeningScreen(Screen):
         self._lines.append(text)
         self._words += len(text.split())
         self.query_one("#meter", LevelMeter).set_counts(len(self._lines), self._words)
-        # Settle caption to final text; log gets the plain line (no timestamps).
+        # Settle caption to final text — the only on-screen transcript is the
+        # big caption; session history lives in _lines for export/copy.
         self._set_caption_indicator("final", text)
         self._set_status_line("listening")  # ready for next utterance after final
-        self.query_one("#transcript", RichLog).write(escape(text))
 
     @on(SessionDone)
     def session_done(self, event: SessionDone) -> None:
         self._set_live_ui(False)
         self._audio = getattr(event, "audio", None)
         self._audio_sr = int(getattr(event, "sample_rate", 16000) or 16000)
-        log = self.query_one("#transcript", RichLog)
         polished = (event.polished or "").strip()
         if polished and not event.error and not self._cleared:
             # Full-session re-decode won: it becomes the whole transcript —
-            # even when the live loop committed zero finals.
+            # even when the live loop committed zero finals. It settles into
+            # the big caption; export/copy still read _lines.
             self._lines = [polished]
             self._words = len(polished.split())
             self.query_one("#meter", LevelMeter).set_counts(1, self._words)
-            log.clear()
-            log.write(escape(polished))
             self._set_caption_indicator("final", polished)
-            self._show_record_layout()
+            self._show_live_layout()
             secs = f"{event.recorded_sec:.0f}s" if event.recorded_sec else "session"
             self._set_status_line(
                 "stopped", f"polished — full audio re-decoded ({secs})"
             )
             return
+        self._show_live_layout()
         if event.error:
-            self._show_live_layout()
             short = str(event.error).split(". ")[0].rstrip(".")
-            self._set_status_line("stopped", f"error — {short} · full text in log")
-            log.write(f"[red]{escape(str(event.error))}[/]")
+            self._set_status_line("stopped", f"error — {short}")
             return
-        if self._lines:
-            # Recording done: the transcript log takes over the caption area.
-            self._show_record_layout()
-        else:
-            self._show_live_layout()
         self._set_status_line("stopped")
 
 
@@ -1696,9 +1669,14 @@ class AudioLiveApp(App[None]):
         color: #6b6b6b;
     }
 
-    /* —— caption stage: compact; the transcript gets the reclaimed rows —— */
+    /* —— caption stage: fills the listen area; the big live caption is the
+       only on-screen transcript (history lives in _lines for export) ——
+       Textual CSS has no font-family or font-size (declaring it is an error
+       and the TUI will not start); the caption inherits Terminal.app's font.
+       Preferred stack for 繁體中文（香港）: PingFang HK（蘋方-港）, Noto Sans HK,
+       Noto Sans TC — set that face in Terminal.app, README "Hong Kong CJK font". */
     #caption-stage {
-        height: 8;
+        height: 1fr;
         margin: 0 0 1 0;
         padding: 1 2;
         border: none;
@@ -1722,40 +1700,6 @@ class AudioLiveApp(App[None]):
     #caption.caption-status {
         color: #8a8a8a;
         text-style: italic;
-    }
-
-    /* subtle separator between caption and log */
-    #stage-rule, .rule {
-        height: 1;
-        color: #2a2a2a;
-        background: #0a0a0a;
-        border-top: solid #2a2a2a;
-        margin: 0 1 1 1;
-    }
-
-    /* —— transcript log —— */
-    #log-scroll {
-        height: 1fr;
-        border: none;
-        background: #0a0a0a;
-        padding: 0 1;
-    }
-    /* Caption (#partial) and transcript log (#transcript).
-       Textual CSS has no font-family or font-size. Declaring
-       font-family is an error ("Invalid CSS property 'font-family'")
-       and the TUI will not start. These widgets inherit Terminal.app's
-       font. Preferred stack for 繁體中文（香港）, in order:
-       PingFang HK（蘋方-港）, Noto Sans HK, Noto Sans TC.
-       Set that face in Terminal.app — README, "Hong Kong CJK font". */
-    #transcript {
-        height: auto;
-        min-height: 100%;
-        background: #0a0a0a;
-        color: #e8e8e8;
-        text-wrap: wrap;
-        scrollbar-background: #0a0a0a;
-        scrollbar-color: #2a2a2a;
-        scrollbar-color-hover: #3a3a3a;
     }
 
     /* keep partial widget for hooks; hide visually (live text is on #caption) */

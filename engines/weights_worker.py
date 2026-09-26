@@ -1,8 +1,9 @@
 """One-shot model weight downloader, run as a child process (or in-proc).
 
 `python -m engines.weights_worker <code>` downloads one engine's weights —
-GitHub release tar first for dir engines, Hugging Face as fallback — printing `progress <bytes>`
-lines to stdout so a parent can show a counter.
+self-hosted tarballs first (R2, then the GitHub release), Hugging Face as
+fallback — printing `progress <bytes>` lines to stdout so a parent can show a
+counter.
 
 Stalls are handled by self-terminating with exit code 42: a hub download that
 stops moving cannot be cancelled as a thread, and a hung thread holds HF's
@@ -18,7 +19,9 @@ import time
 
 from engines import weights as w
 
-PROGRESS_STEP_BYTES = 5 * 1024 * 1024
+# Progress lines are throttled to byte steps; 1 MB keeps the picker's
+# percentage ticking smoothly against its 0.5 s UI refresh.
+PROGRESS_STEP_BYTES = 1 * 1024 * 1024
 
 
 def download_sync(code: str, watch: bool = True, on_total=None) -> int:
@@ -62,21 +65,21 @@ def download_sync(code: str, watch: bool = True, on_total=None) -> int:
     if watch:
         threading.Thread(target=poll, daemon=True).start()
     try:
-        # Prefer GitHub release tarballs for dir engines when available.
-        # Hugging Face LFS (cdn-lfs) is often unreachable or stalls after a
-        # few MB of config; only fall through to HF when releases are off
-        # or the tarball path fails.
-        base = w._release_base()
-        used_release = False
-        if kind == "dir" and base and base.lower() not in ("hf", "off"):
+        # Self-hosted tarballs first (R2, then the GitHub release; see
+        # weights._tarball_bases). Hugging Face LFS (cdn-lfs) is often
+        # unreachable or stalls after a few MB of config; only fall through
+        # to HF when every tarball source fails or is disabled.
+        used_tarball = False
+        for base in w._tarball_bases():
             try:
                 w._download_and_extract_tarball(
                     f"{base}/{path.name}.tar", path.parent, part, on_total=report_total
                 )
-                used_release = True
+                used_tarball = True
+                break
             except Exception:
-                used_release = False
-        if not used_release:
+                used_tarball = False
+        if not used_tarball:
             w._download_hf(repo, path, kind, on_total=report_total)
         if not w.download_ok(code):
             raise RuntimeError(f"download incomplete: {key or 'weights'} missing or empty")

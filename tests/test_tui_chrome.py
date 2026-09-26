@@ -170,7 +170,7 @@ class TuiChromeTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(callable(screen._context))
             self.assertIn("Live", str(btn_live.label))  # back to start state
 
-    async def test_loading_and_record_layout_states(self) -> None:
+    async def test_loading_and_live_layout_states(self) -> None:
         app = AudioLiveApp()
 
         async with app.run_test(size=(100, 28)) as pilot:
@@ -182,11 +182,9 @@ class TuiChromeTest(unittest.IsolatedAsyncioTestCase):
 
             panel = screen.query_one("#loading-panel")
             caption = screen.query_one("#caption-stage")
-            log = screen.query_one("#log-scroll")
-            # Default: live layout.
+            # Default: live layout, caption filling the listen area.
             self.assertFalse(panel.display)
             self.assertTrue(caption.display)
-            self.assertTrue(log.display)
 
             screen._show_loading(
                 "Loading Parakeet (MLX GPU)…", "mic opens once the model is ready"
@@ -194,21 +192,12 @@ class TuiChromeTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertTrue(panel.display)
             self.assertFalse(caption.display)
-            self.assertFalse(log.display)
             self.assertIn("Loading Parakeet", _plain(panel))
             self.assertIn("mic opens once the model is ready", _plain(panel))
 
             screen._show_live_layout()
             await pilot.pause()
             self.assertTrue(caption.display)
-            self.assertTrue(log.display)
-            self.assertFalse(panel.display)
-
-            # Recording done: the transcript log takes over the caption area.
-            screen._show_record_layout()
-            await pilot.pause()
-            self.assertFalse(caption.display)
-            self.assertTrue(log.display)
             self.assertFalse(panel.display)
 
     async def test_loading_spinner_animates(self) -> None:
